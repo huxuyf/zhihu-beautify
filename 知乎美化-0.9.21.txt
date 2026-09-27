@@ -1,0 +1,1796 @@
+// ==UserScript==
+// @name         知乎美化
+// @version      0.9.21
+// @author       ShingU
+// @description  提高知乎使用体验
+// @match        *://www.zhihu.com/*
+// @match        *://zhuanlan.zhihu.com/*
+// @exclude      https://www.zhihu.com/signin*
+// @icon         data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==
+// @grant        GM_info
+// @grant        window.onurlchange
+// @sandbox      JavaScript
+// @license      MIT
+// @run-at       document-end
+// ==/UserScript==
+
+'use strict';
+// ========== 功能开关 ==========
+// 0.9.14 重构：原 CONFIG 配置对象已移除 —— 脚本菜单与设置界面早已删掉，每一项都是固定值，
+// 再留一层间接引用只会让人误会「可以在这里调」。现在各开关的默认值直接内联在使用位置：
+//   · 固定开启（true）的功能：开关判断一并删掉，功能代码无条件执行
+//   · 固定关闭（false）的功能：连同永远不会执行到的实现一起删除
+// 想恢复某一项，从历史版本（0.9.13）取回对应代码块。
+
+// 添加收起回答观察器
+//
+// 【2026-09-25 修复 · P0】选择器不再依赖 `.Sticky`
+// 实测（已登录真实页面）：知乎的「收起」按钮 [data-zop-retract-question] 分为两处挂载——
+//   · 静态操作栏：div.ContentItem-actions.RichContent-actions…（**无 Sticky**）——页面加载后即存在
+//   · 悬浮操作栏：div.ContentItem-actions.Sticky.RichContent-actions…——只在滚动到回答中部、栏位吸底时才动态加 `.Sticky`
+// 观察器触发时（新回答刚插入 DOM）页面尚未滚动，悬浮栏还不存在，
+// 因此旧写法 `.ContentItem-actions.Sticky [data-zop-retract-question]` 恒为 0 命中 → 「默认收起回答」静默失效。
+// 去掉 `.Sticky` 后即可匹配静态栏里的收起按钮（按钮类名仍为 ContentItem-rightButton，属性为 data-zop-retract-question）。
+// 统一的样式注入：按 id 判重（幂等），重复调用无副作用；
+// 各功能模块不再各自维护「_xxxInjected 布尔标志 + createElement + appendChild」样板
+function injectStyle(id, css) {
+    if (document.getElementById(id)) return
+    const style = document.createElement('style');
+    style.id = id;
+    style.textContent = css;
+    (document.head || document.documentElement).appendChild(style);
+}
+
+function getCollapsedAnswerObserver() {
+    if (!window._collapsedAnswerObserver) {
+        const observer = new MutationObserver(mutations => {
+            for (const mutation of mutations) {
+                if (mutation.target.hasAttribute('script-collapsed')) return
+                // 短的回答
+                if (mutation.target.classList.contains('RichContent')) {
+                    for (const addedNode of mutation.addedNodes) {
+                        if (addedNode.nodeType != Node.ELEMENT_NODE) continue
+                        if (addedNode.className != 'RichContent-inner') continue
+                        if (addedNode.offsetHeight < 400) break
+                        const button = mutation.target.querySelector('.ContentItem-actions [data-zop-retract-question]');
+                        if (button) {
+                            mutation.target.setAttribute('script-collapsed', '');
+                            button.click();
+                            return
+                        }
+                    }
+                // 长的回答
+                } else if (mutation.target.tagName === 'DIV' && !mutation.target.style.cssText && !mutation.target.className) {
+                    if (mutation.target.parentElement.hasAttribute('script-collapsed')) return
+                    const button = mutation.target.querySelector('.ContentItem-actions [data-zop-retract-question]');
+                    if (button) {
+                        mutation.target.parentElement.setAttribute('script-collapsed', '');
+                        button.click();
+                        return
+                    }
+                }
+            }
+        })
+
+        observer.start = function() {
+            if (!this._active) {
+                this.observe(document, { childList: true, subtree: true });
+                this._active = true;
+            }
+        }
+        observer.end = function() {
+            if (this._active) {
+                this.disconnect();
+            }
+        }
+
+        window.addEventListener('urlchange', function() {
+            observer[location.href.indexOf('/answer/') === -1 ? 'start' : 'end']();
+        })
+        window._collapsedAnswerObserver = observer;
+    }
+    return window._collapsedAnswerObserver
+}
+
+// 默认收起回答
+function defaultCollapsedAnswer() {
+    const observer = getCollapsedAnswerObserver();
+    if (location.href.indexOf('/answer/') === -1) {
+        observer.start();
+    }
+}
+
+// 取「该往哪个右下角悬浮按钮容器里插按钮」。
+// 【2026-09-25 修复 · P1】知乎现版 .CornerAnimayedFlex 有**两个**，且都带 --kanshan 修饰：
+//   ① CornerAnimayedFlex--kanshan CornerAnimayedFlex--hidden      → 装「回到顶部」，滚到页面顶部时 height:0
+//   ② CornerAnimayedFlex--kanshan CornerAnimayedFlex--kanshanEntry → 装知乎 AI「看山」入口，常驻可见
+// 老版只有一个容器，所以原来那句 querySelector('.CornerAnimayedFlex') 一直是对的；
+// 知乎改版后它命中的是①（隐藏容器）→ 插进去的按钮父容器高度 0，
+// DOM 在、点击事件也绑上了，但用户**永远看不见**（实测 2026-09-25，真实登录态）。
+// 改为优先取「可见的那个」（offsetHeight > 0），一个都不可见时退回第一个，保证兜底不断链。
+function cornerFlexForInject() {
+    const list = document.querySelectorAll('.CornerAnimayedFlex');
+    for (let i = 0; i < list.length; i++) {
+        if (list[i].offsetHeight > 0) return list[i]
+    }
+    return list.length ? list[0] : null
+}
+
+// 一键收起回答+评论（全部）
+function collapsedAnswer() {
+    const flex = cornerFlexForInject();
+    if (flex && !document.getElementById('collapsed-button')) {
+        // 向网页中插入收起全部回答按钮+样式+绑定点击事件
+        document.head.appendChild(document.createElement('style')).textContent = '.CornerButton{margin-bottom:8px !important;}.CornerButtons{bottom:25px !important;} .CornerAnimayedFlex {height: auto;}';
+        // 类名从容器里的「普通按钮」抄一份（排除看山入口按钮 —— 它带 KanshanCornerButton 专属类，
+        // 抄过来我们的按钮会长得像看山）。可见容器里只剩看山按钮时，退回全页找第一个普通按钮
+        const tplBtn = flex.querySelector('button:not(.KanshanCornerButton)') || document.querySelector('.CornerAnimayedFlex>button');
+        flex.insertAdjacentHTML('afterBegin', '<button id="collapsed-button" data-tooltip="收起全部回答/评论" data-tooltip-position="left" data-tooltip-will-hide-on-click="false" aria-label="收起全部回答/评论" type="button" class="' + (tplBtn ? tplBtn.className : '') + '"><svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true" color="var(--MapText02A)" class="Zi Zi--ArrowUpward" fill="currentColor" style="-webkit-transform: rotate(180deg);transform: rotate(180deg);"><path d="M4.336 10.07a.875.875 0 0 1 .094-1.234l7-6 .003-.002a.87.87 0 0 1 .12-.085l.01-.007a.873.873 0 0 1 .131-.061l.012-.004a.874.874 0 0 1 .586 0l.011.004a.872.872 0 0 1 .262.153l.004.002 7 6a.875.875 0 0 1-1.139 1.328l-5.555-4.761V20.5a.875.875 0 0 1-1.75 0V5.403l-5.556 4.761a.875.875 0 0 1-1.233-.095Z"></path></svg></button>');
+        document.getElementById('collapsed-button').onclick = function () {
+
+            // 收起所有评论（悬浮的 [收起评论]）
+            document.querySelectorAll('.Comments-container').forEach(function (el) {
+                let commentCollapseButton = getXpath('//button[text()="收起评论"]', el)
+                if (commentCollapseButton) commentCollapseButton.click();
+            });
+            // 收起所有评论（固定的 [收起评论]）
+            document.querySelectorAll('.RichContent >.ContentItem-actions>button:first-of-type').forEach(function (el) {
+                if (el.textContent.indexOf('收起评论') > -1) el.click()
+            });
+
+            if (location.pathname === '/') {// 只对推荐页的信息流
+                // 【2026-09-25 修复】首页信息流默认不渲染收起按钮，只有点过「阅读全文」展开的卡片才会出现
+                // data-zop-retract-question，所以此处按属性匹配（可能为空）是正常现象，不再要求 ContentItem-rightButton 同时命中
+                document.querySelectorAll('[data-zop-retract-question]').forEach(function (el) {el.click();});
+            } else {
+                // 被 getCollapsedAnswerObserver 函数收起过的，固定 [收起] 按钮
+                document.querySelectorAll('[script-collapsed]').forEach(function(scriptCollapsed) {scriptCollapsed.querySelectorAll('.ContentItem-actions [data-zop-retract-question]').forEach(function(button) {button.click();});})
+                // 尚未标记 [script-collapsed] 的回答，其余 [收起] 按钮（静态栏/悬浮栏均可，见 getCollapsedAnswerObserver 处说明）
+                document.querySelectorAll('.RichContent:not([script-collapsed]) .ContentItem-actions [data-zop-retract-question]').forEach(function(button) {
+                    let el = button.parentElement;
+                    while (!el.classList.contains('RichContent')) {el = el.parentElement;}
+                    if (el) el.setAttribute('script-collapsed', '');
+                    button.click();
+                })
+
+                const observer = getCollapsedAnswerObserver();
+                observer.start();
+            }
+        }
+    }
+}
+
+// [收起评论] 按钮的选择器：固定 / 悬浮两种形态查找条件完全一致，抽成常量避免 5 处重复
+const COLLAPSE_COMMENT_BTN = 'button.Button.ContentItem-action.Button--plain.Button--withIcon.Button--withLabel:first-of-type'
+
+// 在 el 所属的回答主体里找 [收起评论] 并点击；点到返回 true（0.9.20 抽取：原两处兜底分支逐行重复）
+function collapseCommentUnder(el) {
+    const parent = findParentElement(el, 'List-item') || findParentElement(el, 'Card ')
+    if (!parent) return false
+    const btn = parent.querySelector(COLLAPSE_COMMENT_BTN)
+    if (!btn || btn.textContent.indexOf('收起评论') < 0) return false
+    btn.click()
+    if (!isElementInViewport(btn)) scrollTo(0, parent.offsetTop + parent.offsetHeight - 50)
+    return true
+}
+
+// 收起当前回答、评论（监听点击事件，点击网页两侧空白处）
+function collapsedNowAnswer(selectors) {
+    backToTop(selectors) // 快捷回到顶部
+    let element = document.querySelector(selectors)
+    if (element) {
+        element.onclick = function(event){
+            if (event.target == this) {
+                // 下面这段主要是 [收起回答]，顺便 [收起评论]（如果展开了的话）
+                // 【2026-09-25 修复】去掉 .Sticky（见 getCollapsedAnswerObserver 处说明）：
+                // 实测该吸底栏真实类名为 "ContentItem-actions Sticky RichContent-actions ContentItem-actions--hasHotComment is-fixed is-bottom"，
+                // 用 is-fixed.is-bottom 定位即可，不再依赖 .Sticky 是否被加上
+                let rightButton = document.querySelector('.ContentItem-actions.RichContent-actions.is-fixed.is-bottom')
+                if (rightButton) { // 悬浮在底部的 [收起回答]（此时正在浏览回答内容 [中间区域]）
+                    // 固定的 [收起评论]（先看看是否展开评论）
+                    const c = rightButton.querySelector(COLLAPSE_COMMENT_BTN)
+                    if (c && c.textContent.indexOf('收起评论') > -1) c.click()
+                    // 再去收起回答
+                    const retract = rightButton.querySelector('[data-zop-retract-question]')
+                    if (retract) retract.click()
+                } else { // 固定在回答底部的 [收起回答]（此时正在浏览回答内容 [尾部区域]）
+                    // 先找可视区域内的 [收起回答] 按钮，顺手收起它上面的 [收起评论]
+                    let collapsed = false
+                    for (const el of document.querySelectorAll('[data-zop-retract-question]')) {
+                        if (!isElementInViewport(el)) continue
+                        const c = el.parentNode.querySelector(COLLAPSE_COMMENT_BTN)
+                        if (c && c.textContent.indexOf('收起评论') > -1) {
+                            c.click()
+                            if (!isElementInViewport(c)) scrollTo(0, el.offsetTop + 50)
+                        }
+                        el.click() // 再去收起回答
+                        collapsed = true // 点到收起了，就没必要执行下面的兜底了
+                        break
+                    }
+                    // 兜底：完全看不到 [收起回答] 按钮时（如 [头部区域]，以及部分明明很长却不显示悬浮横条的回答）
+                    if (!collapsed) {
+                        for (const el of document.querySelectorAll('.List-item, .Card.AnswerCard, .Card.TopstoryItem')) {
+                            if (!isElementInViewport_(el)) continue
+                            const c = el.querySelector(COLLAPSE_COMMENT_BTN)
+                            if (c && c.textContent.indexOf('收起评论') > -1) {
+                                c.click()
+                                if (!isElementInViewport(c)) scrollTo(0, el.offsetTop + 50)
+                            }
+                            const retract = el.querySelector('[data-zop-retract-question]')
+                            if (retract) retract.click() // 再去收起回答
+                            break
+                        }
+                    }
+                }
+
+                // 下面这段只针对 [收起评论]（如果展开了的话）
+                // 悬浮的 [收起评论]（此时正在浏览评论内容 [中间区域]）
+                const floating = getXpath('//button[text()="收起评论"]', document.querySelector('.Comments-container'))
+                if (floating) {
+                    floating.click()
+                    return
+                }
+                // 固定的 [收起评论]（此时正在浏览评论内容 [头部区域]）
+                let collapsedComment = false
+                for (const el of document.querySelectorAll('.ContentItem-actions > ' + COLLAPSE_COMMENT_BTN + ', .ContentItem-action > ' + COLLAPSE_COMMENT_BTN)) {
+                    if (el.textContent.indexOf('收起评论') > -1 && isElementInViewport(el)) {
+                        el.click()
+                        collapsedComment = true
+                        break
+                    }
+                }
+                // 兜底：不上不下（既看不到固定的又看不到悬浮的 [收起评论]）时，
+                // 从可视区域中的评论容器 / 评论回复框向上找所属回答主体的 [收起评论]
+                if (!collapsedComment) {
+                    for (const el of document.querySelectorAll('.Comments-container, .Editable-content')) {
+                        if (isElementInViewport(el) && collapseCommentUnder(el)) break
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 回到顶部（监听点击事件，鼠标右键点击网页两侧空白处）
+function backToTop(selectors) {
+    let element = document.querySelector(selectors)
+    if (element) {
+        element.oncontextmenu = function(event){
+            if (event.target == this) {
+                event.preventDefault();
+                window.scrollTo(0,0)
+            }
+        }
+    }
+}
+
+//获取元素是否在可视区域（完全可见）
+function isElementInViewport(el) {
+    let rect = el.getBoundingClientRect();
+    return (
+        rect.top >= 0 &&
+        rect.left >= 0 &&
+        rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
+        rect.right <= (window.innerWidth || document.documentElement.clientWidth)
+    );
+}
+//获取元素是否在可视区域（部分可见）
+function isElementInViewport_(el) {
+    let rect = el.getBoundingClientRect();
+    return (
+    rect.top < (window.innerHeight || document.documentElement.clientHeight) &&
+    rect.bottom > 0
+  );
+}
+
+// 寻找父元素：从 item 往上逐级找第一个「class 包含 className」的祖先。
+// （0.9.20：原 type 参数的「完全一致」分支没有任何调用点，属死代码，连同双分支一并删除）
+function findParentElement(item, className) {
+    const parent = item.parentElement;
+    if (!parent) return
+    if (parent.className && parent.className.indexOf(className) > -1) return parent
+    return findParentElement(parent, className)
+}
+
+// 移除高亮链接
+function cleanHighlightLink() {
+    const callback = (mutationsList, observer) => {
+        for (const mutation of mutationsList) {
+            for (const target of mutation.addedNodes) {
+                if (target.nodeType != 1 || target.tagName != 'A') break
+                if (target.dataset.zaNotTrackLink && target.href.indexOf('https://zhida.zhihu.com/search?') > -1) {
+                    target.parentElement.replaceWith(target.textContent);
+                }
+            }
+        }
+    };
+    const observer = new MutationObserver(callback);
+    observer.observe(document, { childList: true, subtree: true });
+
+    // 针对的是打开网页后直接加载的前面几个回答（上面哪些是针对动态加载的回答）
+    document.querySelectorAll('span > a[data-za-not-track-link][href^="https://zhida.zhihu.com/search?"]').forEach(e => e.parentElement.replaceWith(e.textContent))
+}
+
+// 区分问题文章
+function addTypeTips() {
+    let style = `font-weight: bold;font-size: 13px;padding: 1px 4px 0;border-radius: 2px;display: inline-block;vertical-align: top;margin: ${(location.pathname === '/search') ? '2' : '4'}px 4px 0 0;`
+    document.body.appendChild(document.createElement('style')).textContent = `/* 区分问题文章 */
+.AnswerItem .ContentItem-title a:not(.zhihu_e_toQuestion)::before {content:'问题';color: #f68b83;background-color: #f68b8333;${style}}
+/* 针对的是部分搜索词下搜索页开头的 "最新讨论" 之类的非常规元素 */
+.HotLanding-contentItem .ContentItem[data-za-detail-view-path-module=Content] .ContentItem-title a:not(.zhihu_e_toQuestion)::before {content:'问题';color: #f68b83;background-color: #f68b8333;${style}}
+.TopstoryQuestionAskItem .ContentItem-title a:not(.zhihu_e_toQuestion)::before {content:'问题';color: #ff5a4e;background-color: #ff5a4e33;${style}}
+.PinItem .ContentItem-title a::before {content:'想法';color: #4CAF50;background-color: #4CAF5033;${style}}
+.ArticleItem .ContentItem-title a::before {content:'文章';color: #2196F3;background-color: #2196F333;${style}}`;
+}
+
+// 直达问题按钮
+function addToQuestion() {
+
+    // 一开始加载的信息流 + 添加按钮样式
+    if (location.pathname === '/search') {
+        document.lastChild.appendChild(document.createElement('style')).textContent = `a.zhihu_e_toQuestion {font-size: 13px !important;font-weight: normal !important;padding: 1px 6px 0 !important;border-radius: 2px !important;display: inline-block !important;vertical-align: top !important;height: 20.67px !important;line-height: 20.67px !important;margin-top: 2px !important;}`;
+        addSetInterval_('h2.ContentItem-title a:not(.zhihu_e_tips)');
+    } else {
+        document.lastChild.appendChild(document.createElement('style')).textContent = `a.zhihu_e_toQuestion {font-size: 13px !important;font-weight: normal !important;padding: 1px 6px 0 !important;border-radius: 2px !important;display: inline-block !important;vertical-align: top !important;margin-top: 4px !important;}`;
+        document.querySelectorAll('h2.ContentItem-title a:not(.zhihu_e_tips)').forEach(function(item){addTypeTips_(item);})
+    }
+
+    // 后续加载的信息流
+    const observer = new MutationObserver(mutationsList => {
+        for (const mutation of mutationsList) {
+            for (const target of mutation.addedNodes) {
+                if (target.nodeType != 1) return
+                addTypeTips_(target.querySelector('h2.ContentItem-title a:not(.zhihu_e_tips)'));
+            }
+        }
+    });
+    observer.observe(document, { childList: true, subtree: true });
+
+    window.addEventListener('urlchange', function(){
+        addSetInterval_('h2.ContentItem-title a:not(.zhihu_e_tips)');
+    })
+
+    function addTypeTips_(titleA) {
+        if (!titleA) return // 判断是否为真
+        if (titleA.parentElement.querySelector('a.zhihu_e_toQuestion')) return // 判断是否已添加
+        if (titleA.textContent.indexOf('?') != -1) { // 把问题末尾英文问好 [?] 的替换为中文问好 [？]，这样按钮与标题之间的间距就刚刚好~
+            titleA.innerHTML = titleA.innerHTML.replace('?', "？")
+        }
+        if (/answer\/\d+/.test(titleA.href)) { //  如果是指向回答的问题（而非指向纯问题的链接）
+            const titleA_meta = titleA.parentElement.parentElement.querySelector('meta[itemprop="url"]'); // 获取该问题页地址
+            if (!titleA_meta) return // 判断元素是否存在（针对的是部分搜索词下搜索页开头的 "最新讨论" 之类的非常规元素）
+            titleA.insertAdjacentHTML('afterend', `<a class="zhihu_e_toQuestion VoteButton" href="${titleA_meta.content}" target="_blank">直达问题</a>`);
+        }
+    }
+
+    function addSetInterval_(A) {
+        let timer = setInterval(function(){
+            let aTag = document.querySelectorAll(A);
+            if (aTag.length > 0) {
+                clearInterval(timer);
+                aTag.forEach(function(item){addTypeTips_(item);})
+            }
+        });
+    }
+}
+
+// 快捷关闭悬浮评论（监听点击事件，点击网页两侧空白处）
+function closeFloatingComments() {
+    const closeFloatingCommentsModal = (mutationsList, observer) => {
+        for (const mutation of mutationsList) {
+            for (const target of mutation.addedNodes) {
+                if (target.nodeType != 1) return
+                let button = document.querySelector('button[aria-label="关闭"]');
+                if (button) {button.parentElement.parentElement.onclick = function(event){if (event.target.parentElement == this) {button.click();}}}
+            }
+        }
+    };
+    const observer = new MutationObserver(closeFloatingCommentsModal);
+    observer.observe(document, { childList: true, subtree: true });
+}
+
+// 自定义 urlchange 事件（用来监听 URL 变化）
+function addUrlChangeEvent() {
+    history.pushState = ( f => function pushState(){
+        var ret = f.apply(this, arguments);
+        window.dispatchEvent(new Event('pushstate'));
+        window.dispatchEvent(new Event('urlchange'));
+        return ret;
+    })(history.pushState);
+
+    history.replaceState = ( f => function replaceState(){
+        var ret = f.apply(this, arguments);
+        window.dispatchEvent(new Event('replacestate'));
+        window.dispatchEvent(new Event('urlchange'));
+        return ret;
+    })(history.replaceState);
+
+    window.addEventListener('popstate',()=>{
+        window.dispatchEvent(new Event('urlchange'))
+    });
+}
+
+function getXpath(xpath, contextNode, doc = document) {
+    contextNode = contextNode || doc;
+    try {
+        const result = doc.evaluate(xpath, contextNode, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+        // 应该总是返回一个元素节点
+        return result.singleNodeValue && result.singleNodeValue.nodeType === 1 && result.singleNodeValue;
+    } catch (err) {
+        throw new Error(`无效 Xpath: ${xpath}`);
+    }
+}
+
+// 显示问题作者
+function question_author() {
+    if (document.querySelector('.BrandQuestionSymbol, .QuestionAuthor, .SpecialQuestionAuthor')) return
+    let qJson = JSON.parse(document.querySelector('#js-initialData').textContent).initialState.entities.questions[/\d+/.exec(location.pathname)[0]].author,
+        html = `<div class="BrandQuestionSymbol"><a class="BrandQuestionSymbol-brandLink" href="/people/${qJson.urlToken}"><img role="presentation" src="${qJson.avatarUrl}" class="BrandQuestionSymbol-logo" alt=""><span class="BrandQuestionSymbol-name">${qJson.name}</span></a><div class="BrandQuestionSymbol-divider" style="margin-left: 5px;margin-right: 10px;"></div></div>`;
+    document.querySelector('.QuestionHeader-topics').insertAdjacentHTML('beforebegin', html);
+}
+
+// [完整显示时间 + 置顶显示时间] 功能修改自：https://greasyfork.org/scripts/402808（从 JQuery 改为原生 JavaScript，且精简、优化了代码）
+// 完整显示时间 + 置顶显示时间
+function topTime_(css, classs) {
+    document.querySelectorAll(css).forEach(function(_this) {
+        const t = _this.querySelector('.ContentItem-time'); if (!t) return
+        const a = t.querySelector('a')   // （0.9.20：原「a.textContent != null」恒真，删；a 存一次引用）
+        if (!(t.classList.contains('full')) && a) {
+            // 完整显示时间
+            topTime_allTime(t)
+            // 发布时间置顶
+            topTime_publishTop(t, _this, classs)
+        }
+    });
+}
+
+// 完整显示时间 + 置顶显示时间 - 文章
+function topTime_post() {
+    let t = document.querySelector('.ContentItem-time:not(.xiu-time)'); if (!t) return
+    // 完整显示时间
+    if (t.textContent.indexOf('编辑于') > -1 && !(t.classList.contains('xiu-time'))) {
+        let tt = t.textContent;
+        t.click();
+        t.textContent = (t.textContent + ' ，' + tt)
+        t.classList.add('xiu-time');
+    }
+
+    // 置顶显示时间
+    if (!(document.querySelector('.Post-Header > .ContentItem-time')) && !(document.querySelector('.ContentItem-meta > .ContentItem-time'))) {
+        let temp_time = t.cloneNode(true);
+        temp_time.style.padding = '0px';
+        document.querySelector('.Post-Header').insertAdjacentElement('beforeEnd', temp_time);
+    }
+}
+
+// 完整显示时间
+function topTime_allTime(t) {
+    if (t.textContent.indexOf('发布于') > -1 && t.textContent.indexOf('编辑于') == -1) {
+        t.querySelector('a').textContent = (t.querySelector('a').dataset.tooltip);
+        t.classList.add('full');
+    } else if (t.textContent.indexOf('发布于') == -1 && t.textContent.indexOf('编辑于') > -1) {
+        t.querySelector('a').textContent = (t.querySelector('a').dataset.tooltip) + ' ，' + (t.querySelector('a').textContent);
+        t.classList.add('full');
+    }
+}
+
+// 置顶显示时间
+function topTime_publishTop(t, _this, _class) {
+    if (!t.parentNode.classList.contains(_class)) {
+        let temp_time = t.cloneNode(true);
+        temp_time.style.padding = '0px';
+        // 对于较短的回答，隐藏回答底部的时间
+        if (_this.offsetHeight < 600) t.style.display = 'none';
+        _this.querySelector('.' + _class).insertAdjacentElement('beforeEnd', temp_time);
+    }
+}
+
+// 问题创建时间
+function question_time() {
+    if (!(document.querySelector('.QuestionPage .QuestionHeader-side .QuestionTime-xiu'))) {
+        document.querySelector('.QuestionPage .QuestionHeader-side').insertAdjacentHTML('beforeEnd', '<div class="QuestionTime-xiu" style="color: #9098ac; margin-top: 5px; font-size: 13px; font-style: italic;"><p>创建时间：' + getUTC8(new Date(document.querySelector('.QuestionPage > meta[itemprop=dateCreated]').content)) + '</p><p>最后编辑：' + getUTC8(new Date(document.querySelector('.QuestionPage > meta[itemprop=dateModified]').content)) + '</p></div>');
+    }
+}
+
+// UTC 标准时转 UTC+8 北京时间，修改自：https://greasyfork.org/zh-CN/scripts/402808（精简）
+function getUTC8(t) {
+    const p = n => String(n).padStart(2, '0');   // 不足两位补零
+    return t.getFullYear() + '-' + p(t.getMonth() + 1) + '-' + p(t.getDate()) +
+        '\xa0\xa0' + p(t.getHours()) + ':' + p(t.getMinutes()) + ':' + p(t.getSeconds());
+}
+
+// 默认高清原图（无水印）
+function originalPic(){
+    document.querySelectorAll('img[data-original][data-original-token][data-lazy-status]:not([data-original-xiu]):not(.comment_sticker):not(.Avatar)').forEach(function(one){one.src = 'https://' + one.dataset.original.split('/')[2] + '/' + one.dataset.originalToken + '.webp'; one.dataset.originalXiu = 'true';});
+}
+
+// 默认站外直链，修改自：https://greasyfork.org/scripts/402808（从 JQuery 改为原生 JavaScript，且精简、优化了代码）
+function directLink () {
+    document.querySelectorAll('a.external[href*="link.zhihu.com/?target="], a.LinkCard[href*="link.zhihu.com/?target="]:not(.MCNLinkCard):not(.ZVideoLinkCard):not(.ADLinkCardContainer)').forEach(function (_this) {_this.href = decodeURIComponent(_this.href.substring(_this.href.indexOf('link.zhihu.com/?target=') + 23));});
+}
+
+// ========== 剪贴板消毒 ==========
+// 复制时只写入纯文本，避免把知乎的富文本样式、隐藏的来源标记、分享/跟踪参数一并带走
+var COPY_TAIL_PATTERNS = [
+    /^\s*(?:展开)?阅读全文\s*$/,                                    // [阅读全文] 按钮
+    /^\s*(赞同|喜欢|收藏|评论|分享|关注)\s*[\d.,万千]*\s*$/,          // 操作栏文案（赞同 1,234 / 评论 …）
+    /^\s*(?:发布|编辑)于\s*\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}.*$/,     // 发布于 / 编辑于 时间
+    /^\s*IP\s*属地[:：]?.*$/,                                      // IP 属地
+    /^\s*Read more[:：].*$/i                                       // 反复复制后残留的来源行
+];
+
+// 取当前选中的文本：优先输入框，其次页面选区（复制图片等无文本场景返回空）
+function getCopySelectedText() {
+    const active = document.activeElement;
+    if (active && (active.tagName === 'TEXTAREA' || (active.tagName === 'INPUT' && /^(?:text|search|url|tel|password)$/i.test(active.type))) && typeof active.selectionStart === 'number' && active.selectionEnd > active.selectionStart) {
+        return active.value.slice(active.selectionStart, active.selectionEnd);
+    }
+    const selection = window.getSelection ? window.getSelection() : null;
+    return selection ? selection.toString() : '';
+}
+
+// 文本消毒：去掉零宽字符，并清理尾部知乎附加的按钮文案/时间地点等信息
+function cleanCopyText(text) {
+    let out = (text || '').replace(/[\u200b-\u200f\ufeff]/g, ''); // 知乎常往数字、标题里塞零宽字符
+    const lines = out.split('\n');
+    while (lines.length > 0) {
+        const last = lines[lines.length - 1];
+        if (!last.trim()) { lines.pop(); continue; }                                       // 尾部空行
+        if (COPY_TAIL_PATTERNS.some(function (re) { return re.test(last) })) {             // 尾部残留
+            lines.pop();
+            continue;
+        }
+        break;
+    }
+    return lines.join('\n').replace(/\s+$/, ''); // 只清尾部，保留正文首行缩进（避免破坏复制的代码块）
+}
+
+// 注册复制事件（阻止默认的富文本写入 = 消毒）
+function copySanitize() {
+    document.addEventListener('copy', function (e) {
+        const clipdata = e.clipboardData || window.clipboardData;
+        if (!clipdata) return
+        const text = getCopySelectedText();
+        if (!text || !text.trim()) return // 没有选中文本（如复制图片）就不干预默认行为
+        let out = cleanCopyText(text);
+        e.preventDefault();
+        clipdata.setData('text/plain', out); // 原片段的 'Text' 是 IE 老写法，现代浏览器统一用 text/plain
+    });
+}
+
+// ========== 页面布局：隐藏右侧栏，主内容占满整行 ==========
+// 用 CSS 隐藏而不是 removeChild：知乎是 React 渲染，直接删节点容易触发它自己的重渲染/报错；
+// CSS 是静态样式，对后续动态插入的节点同样生效，视觉上等同于"删掉"。
+function layoutFullWidth() {
+    const rules = [];
+        rules.push(
+            // 第二个 div（右侧栏）
+            '.Question-sideColumn {display: none !important;}',
+            // 0.9.18：按埋点属性删右侧栏 —— 类名知乎随时会改，这个 data-za-* 埋点属性是稳定锚点；
+            // 出现在哪个页面就删哪个页面（问题页 / 回答页等的「相关推荐」侧栏）
+            '[data-za-detail-view-path-module=RightSideBar] {display: none !important;}',
+            // 第一个 div（主列）占满该节点：.Question-mainColumn 是知乎现有类名，
+            // 后面的 :has() 兜底则是照着"侧栏所在容器的第一个子元素"来选，类名变了也还能生效
+            '.Question-mainColumn, *:has(> .Question-sideColumn) > :first-child {width: 100% !important;max-width: none !important;flex: 1 1 auto !important;box-sizing: border-box;}',
+            // 侧栏按属性删掉后，主列同样要占满：以「该属性节点所在的 flex/grid 容器」为准，第一个子元素撑满
+            '*:has(> [data-za-detail-view-path-module=RightSideBar]) > :first-child {width: 100% !important;max-width: none !important;flex: 1 1 auto !important;box-sizing: border-box;}'
+        );
+        // :has(> :nth-child(2)) 是安全互锁 —— 只有「第 3 个区块确实还有子区块」即结构符合预期时才动手，
+        // 万一 .Post-content 实际上是正文容器（子元素是段落），这些规则会整体失效，不会误删文章内容
+        rules.push(
+            '.Post-content > :nth-child(3):has(> :nth-child(2)) > :nth-child(2) {display: none !important;}',
+            '.Post-content > :nth-child(3):has(> :nth-child(2)) > :first-child {width: 100% !important;max-width: none !important;flex: 1 1 auto !important;box-sizing: border-box;}',
+            '.Post-content > :nth-child(3):has(> :nth-child(2)) + :nth-child(4) {display: none !important;}'
+        );
+    injectStyle('zhihuE-layoutFullWidth', rules.join('\n'));
+}
+
+// ========== 左栏 50/50 双栏 + 右侧预览面板（0.9.2 起；0.9.11 泛化到多个页面；0.9.21 改窗口滚动）==========
+// 设计要点：
+//   · 只改 CSS/加面板，不搬动知乎的 React 节点 —— 这些页面是 React 渲染，动 DOM 结构容易触发重渲染报错
+//   · 左侧滚动容器仍是知乎自己的元素（.Topstory-container / .HotList / …），脚本只给它打一个
+//     自己的类名（SPLIT_LEFT_CLASS）再把 50vw + 独立滚动的样式挂上去；右侧是本脚本 new 出来的固定定位面板
+//   · 所有样式都挂在 html.zhihu-split 下，离开这些页面移除类名即完全失效（保证「只作用于登记的页面」）
+//   · 生效页面由 SPLIT_PROFILES 决定（0.9.11 起不再写死路径与选择器），见其注释
+// 与下面 CSS 里的 html.zhihu-split 是同一个类名，改名需两处同步
+var SPLIT_CLASS = 'zhihu-split';
+// 只负责「header 不吸顶」的类名 —— 0.9.21 起已废弃：窗口恢复滚动后 header 需要保持
+// 知乎原生的 fixed 吸顶（否则会滚出视口、右侧面板上方留白）。类名与整套 unstick CSS 一并删除。
+var SPLIT_PANEL_ID = 'zhihuE-splitPanel';
+// 脚本认出来的「左栏容器」会被打上这个类名，CSS 一律通过它生效 ——
+// 这样切换页面 / 知乎改版时只改 JS 里的候选选择器，不用动 CSS
+var SPLIT_LEFT_CLASS = 'zhihuE-splitLeft';
+
+// ========== 页面适配表 ==========
+// 【这张表还留着干什么】0.9.2~0.9.10 把左栏容器写死成 .Topstory-container、把条目写死成 .TopstoryItem。
+// 0.9.11 起改成按页面取适配项；0.9.12 起页头导航只留「推荐」，双栏也就只服务「推荐」页，表里只剩 feed 一项。
+// 保留这张表而不是把判定摊平，是为了以后要重新支持某个页面时「加一项就行」：
+// splitViewSync / splitOnClick / splitClear 全都不用改。
+//   root   = 左栏滚动容器的候选选择器（按顺序取第一个够大的）
+//   cards  = 条目的候选选择器（按顺序取第一个命中的）
+//   inline = 渲染路线：true 抽正文 / false 内嵌原页 / 'auto' 运行时自己判断
+// 候选全部落空时还有结构兜底（splitGuessCard），所以新页面通常不用动这张表。
+//
+// 【只认知乎自己的域】右侧面板要么同源内嵌、要么同源取数，跨站点没有任何可用前提。
+// 这个判断单独抽成函数，是为了让离线测试能一处打补丁（见 .workbuddy/zhihu-mock-fixture/server.js）。
+function splitHostOk(host) {
+    return host === 'www.zhihu.com' || /(^|\.)zhihu\.com$/.test(host);
+}
+
+var SPLIT_PROFILES = [
+    {
+        key: 'feed',
+        name: '推荐',
+        test: function (host, path) { return splitHostOk(host) && path === '/' },
+        root: ['.Topstory-container'],
+        cards: ['.TopstoryItem'],
+        inline: true,            // 卡片自带正文 → 沿用「抽正文」路线（0.9.2 以来的行为）
+        titleNewTab: true,       // 点标题 = 新标签打开原页
+        hide: ['.Topstory-sideColumn']
+    },
+
+    // —— 想重新支持某个页面，照抄一项即可（zhuanlan 首页实测可读，选择器已核对过）——
+    // , {
+    //     key: 'zhuanlan-home', name: '知乎专栏首页',
+    //     test: function (host, path) { return host === 'zhuanlan.zhihu.com' && path === '/' },
+    //     root: ['.ColumnHome'],
+    //     cards: ['.ColumnHomeColumnCard', '.ArticleItem', '.Card'],
+    //     inline: 'auto', titleNewTab: false, hide: []
+    // }
+];
+
+var SPLIT_CSS = [
+    // —— 0. 页面级：滚动归还窗口（0.9.21 重设计）——
+    // 旧方案锁死 html/body 高度、把滚动收进左栏内部；实测知乎新版加载器只认窗口滚动，
+    // 内部滚动时列表尾部哨兵永远不满足视口相交判定 → 滚到底也拉不出新内容（2026-09-26 真实页复现）。
+    // 现在不再锁窗口：左栏自然生长、整页走原生滚动，无限加载恢复可靠；右侧面板 position:fixed 恒在屏内。
+    'html.zhihu-split body {margin: 0 !important; padding-bottom: 0 !important;}',
+
+    // —— 1. 左栏：信息流容器，固定 50vw 宽，高度随内容自然生长（滚动交给窗口）——
+    // 先清掉祖先的宽度限制与水平内边距：左栏宽 50vw，祖先若有左右 padding 会把它整体推右并撑出横向溢出
+    'html.zhihu-split main.App-main, html.zhihu-split .Topstory {width: 100% !important; max-width: none !important; margin-left: 0 !important; margin-right: 0 !important; padding-left: 0 !important; padding-right: 0 !important;}',
+    // 左栏容器本身：类名由 JS 按页面适配表打上（见 splitTagLeftRoot），所以这里不认任何知乎专有类名。
+    // 不再限高、不再自己滚：内容多高就多高，整页随窗口滚动（知乎无限加载的前提）
+    'html.zhihu-split .' + SPLIT_LEFT_CLASS + ' {display: block !important; box-sizing: border-box !important; width: 50vw !important; max-width: 50vw !important; min-width: 0 !important; margin: 0 !important; padding: 0 !important; overflow: visible !important;}',
+    'html.zhihu-split .' + SPLIT_LEFT_CLASS + ' > * {box-sizing: border-box !important; width: 100% !important; max-width: 100% !important; min-width: 0 !important;}',
+    // 左侧当前正在预览的那一条加个高亮，避免不知道右侧内容从哪来。
+    // 这个类名只由 JS 加在条目上（抽正文时会先把它从克隆体里摘掉），所以不需要再加容器前缀
+    'html.zhihu-split .zhihuE-splitActive {box-shadow: inset 3px 0 0 #1772f6, 0 0 0 1px rgba(23,114,246,.35) !important;}',
+
+    // —— 3. 右栏：预览面板本体 ——
+    // 面板自身不再滚动：frame 模式滚动在 iframe 内，clone 模式滚动在 .zhihuE-panelSnap 内
+    '#' + SPLIT_PANEL_ID + ' {position: fixed !important; box-sizing: border-box !important; top: var(--zhihuE-split-top, 52px); left: 50vw; width: 50vw; height: calc(100vh - var(--zhihuE-split-top, 52px)); margin: 0; padding: 0; background: #fff; border-left: 1px solid rgba(0, 0, 0, .07); overflow: hidden !important; overscroll-behavior: contain; z-index: 10; text-align: left; font-size: 15px; color: #121212;}',
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelBar {position: relative; z-index: 3; display: flex; align-items: center; gap: 10px; height: 40px; box-sizing: border-box; padding: 0 12px; background: #fff; border-bottom: 1px solid rgba(0, 0, 0, .06);}',
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelTitle {flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 13px; font-weight: 600; color: #444;}',
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelOpen, #' + SPLIT_PANEL_ID + ' .zhihuE-panelClose {flex: 0 0 auto; font-size: 12px; line-height: 1.6; padding: 2px 8px; border-radius: 3px; text-decoration: none !important; cursor: pointer; background: transparent;}',
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelOpen {color: #1772f6 !important; border: 1px solid rgba(23, 114, 246, .35);}',
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelClose {color: #666 !important; border: 1px solid rgba(0, 0, 0, .15); font-family: inherit;}',
+    // —— 面板两态：empty（提示）/ modeClone（显示抽取出的正文）——
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelBody {position: relative; box-sizing: border-box; height: calc(100% - 40px); overflow: hidden;}',
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelEmpty {display: flex; align-items: center; justify-content: center; box-sizing: border-box; height: 100%; padding: 0 24px; text-align: center; font-size: 13px; line-height: 2.1; color: #8a8f99;}',
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap {display: none !important;}',
+    '#' + SPLIT_PANEL_ID + '.zhihuE-modeClone .zhihuE-panelEmpty {display: none !important;}',
+    // clone 模式：快照层自己滚
+    '#' + SPLIT_PANEL_ID + '.zhihuE-modeClone .zhihuE-panelSnap {display: block !important; box-sizing: border-box; height: 100%; padding: 0 16px 40px; overflow-y: auto; overflow-x: hidden !important; overscroll-behavior: contain;}',
+    // 面板内一律按「展开态」渲染：克隆体是只读快照，不需要折叠交互，限高全部解锁
+    '#' + SPLIT_PANEL_ID + ' .RichContent-inner, #' + SPLIT_PANEL_ID + ' .QuestionRichText, #' + SPLIT_PANEL_ID + ' .ContentItem-content, #' + SPLIT_PANEL_ID + ' [class*="collapsed"] {max-height: none !important; overflow: visible !important; -webkit-line-clamp: unset !important;}',
+    // 克隆体里的卡片：去掉固定宽度与吸底操作栏，保证在面板里排版正常
+    '#' + SPLIT_PANEL_ID + ' .TopstoryItem, #' + SPLIT_PANEL_ID + ' .HotItem, #' + SPLIT_PANEL_ID + ' .ArticleItem, ' +
+    '#' + SPLIT_PANEL_ID + ' .Card {width: 100% !important; max-width: none !important; box-sizing: border-box !important;}',
+    '#' + SPLIT_PANEL_ID + ' .TopstoryItem, #' + SPLIT_PANEL_ID + ' .HotItem {margin: 8px 0 0 !important; box-shadow: none !important; border-radius: 0 !important; border: 0 !important;}',
+    '#' + SPLIT_PANEL_ID + ' .ContentItem-actions {position: static !important; box-shadow: none !important;}',
+
+    // —— 4. 横向溢出防护（这是 iframe 方案栽掉的地方，改用正文抽取后必须逐类压死）——
+    // 任何子元素都不允许超过栏宽；正文里的固定像素宽度、长表格、代码块一律就地化解
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap * {max-width: 100% !important; box-sizing: border-box !important;}',
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap img, #' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap video, ' +
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap iframe, #' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap canvas, ' +
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap svg, #' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap figure {max-width: 100% !important; height: auto !important;}',
+    // 表格 / 代码块不缩字，改为各自内部横滚，避免把整个面板撑宽
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap table, #' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap pre, ' +
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap .highlight {display: block; max-width: 100% !important; overflow-x: auto !important; }',
+    // 正文优先换行而不是撑宽（长 URL、无空格长串）
+    '#' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap .RichText, #' + SPLIT_PANEL_ID + ' .zhihuE-panelSnap .RichContent-inner {word-wrap: break-word !important; overflow-wrap: anywhere !important;}'
+];
+
+function splitInjectStyle() {
+    injectStyle('zhihuE-splitView', SPLIT_CSS.join('\n'));
+}
+
+// 按适配项生成「条目宽度归一 + 隐藏知乎自带右栏」这类只有知道类名才写得出的规则。
+// 为什么动态生成而不写死在 SPLIT_CSS 里：这些规则必须跟着当前页面的选择器走 ——
+// 热榜要归一 .HotItem，专栏广场可能是别的类名，写死一套就是 0.9.10 失效的那个坑。
+var _splitStyleProfileKey = '';
+var SPLIT_PROFILE_STYLE_ID = 'zhihuE-splitProfileStyle';
+function splitInjectProfileStyle(profile) {
+    if (!profile || _splitStyleProfileKey === profile.key) return
+    _splitStyleProfileKey = profile.key;
+    const scope = 'html.zhihu-split .' + SPLIT_LEFT_CLASS + ' ';
+    const rules = [];
+    if (profile.cards && profile.cards.length) {
+        rules.push(profile.cards.map(function (s) { return scope + s }).join(',\n') +
+            ' {box-sizing: border-box !important; width: 100% !important; max-width: 100% !important; ' +
+            'min-width: 0 !important; margin-left: 0 !important; margin-right: 0 !important;}');
+    }
+    if (profile.hide && profile.hide.length) {
+        rules.push(profile.hide.map(function (s) { return scope + s }).join(',\n') + ' {display: none !important;}' );
+    }
+    let el = document.getElementById(SPLIT_PROFILE_STYLE_ID);
+    if (!el) {
+        el = document.createElement('style');
+        el.id = SPLIT_PROFILE_STYLE_ID;
+        (document.head || document.documentElement).appendChild(el);
+    }
+    el.textContent = rules.join('\n');
+}
+// ------
+// 面板空态提示。0.9.12 起评论功能已移除，文案里不再提「点 X 条评论」。
+var SPLIT_HINT_HTML = '点击左侧任意条目，正文会显示在这里（自动展开「阅读全文」）<br>点标题或「直达问题」= 新标签页打开原页';
+
+var _splitPanel = null;
+var _splitCurrentItem = null;
+var _splitBound = false;
+var _splitLastTop = -1;
+// 脚本自己发起的 click（展开正文等）置为 true，避免被自己的捕获监听二次拦截
+var _splitSuppressClick = false;
+// 正文展开同样是异步的（要等知乎把全文渲染出来），同样用 token 作废上一次等待
+var _splitExpandToken = 0;
+// 被脚本展开过正文的条目。正文抽进面板后就立刻收回折叠（见 splitShowClone 的时序），
+// 残留的展开态也由「切换条目 / 清空 / 关闭双栏」兜底收回
+var _splitExpandedItem = null;
+
+// 右侧面板：脚本自己 new 出来的容器，不参与知乎的 React 渲染
+function splitBuildPanel() {
+    const panel = document.createElement('div');
+    panel.id = SPLIT_PANEL_ID;
+    panel.innerHTML =
+        '<div class="zhihuE-panelBar">' +
+            '<span class="zhihuE-panelTitle">内容预览</span>' +
+            '<a class="zhihuE-panelOpen" target="_blank" rel="noopener noreferrer" style="display:none;">在新标签打开</a>' +
+            '<button class="zhihuE-panelClose" type="button">清空</button>' +
+        '</div>' +
+        '<div class="zhihuE-panelBody">' +
+            '<div class="zhihuE-panelEmpty">' + SPLIT_HINT_HTML + '</div>' +
+            // 克隆快照层：展示抽取出的正文快照
+            '<div class="zhihuE-panelSnap"></div>' +
+        '</div>';
+    (document.body || document.documentElement).appendChild(panel);
+    panel.querySelector('.zhihuE-panelClose').addEventListener('click', function () { splitClear() });
+    return panel;
+}
+
+function splitGetPanel(create) {
+    if (_splitPanel && !document.documentElement.contains(_splitPanel)) _splitPanel = null;
+    if (!_splitPanel) _splitPanel = document.getElementById(SPLIT_PANEL_ID);
+    if (!_splitPanel && create && document.body) _splitPanel = splitBuildPanel();
+    return _splitPanel;
+}
+
+// —— 页面适配：当前 URL 落在哪个适配项上 ——
+var _splitProfile = null;     // 当前生效的适配项（splitViewSync 里设置）
+var _splitLeftRoot = null;    // 当前被脚本接管成左栏的那个元素
+
+function splitProfileFor(host, path) {
+    for (let i = 0; i < SPLIT_PROFILES.length; i++) {
+        const p = SPLIT_PROFILES[i];
+        // 适配项写错不该拖垮整页：单项判定抛错就跳过它
+        try { if (p.test(host, path)) return p } catch (e) { /* 忽略这一项 */ }
+    }
+    return null
+}
+
+// 左栏根候选：适配项优先，然后通用兜底。
+// 要求「够大」——页面上常有一堆同名的小容器，落到它们身上就成了一个 50vw 的怪盒子。
+// 全部落空时返回 null，调用方必须**放弃启用双栏**：html.zhihu-split 会把 html/body 锁成
+// overflow:hidden，左栏要是没落到任何容器上，整个页面就彻底不能滚了
+// （0.9.10 在 /hot 上就是这个后果：类名加上了、面板也画了，但页面实际是僵的）。
+function splitRootCandidateList(profile) {
+    return (profile && profile.root ? profile.root.slice() : []).concat([
+        '.Topstory-container', 'main.App-main', '[role="main"]', 'main', 'body'
+    ]);
+}
+function splitRootUsable(el) {
+    if (!el || !el.isConnected) return false
+    const r = el.getBoundingClientRect();
+    return r.width >= 320 && r.height >= 200
+}
+function splitFindLeftRoot(profile) {
+    const list = splitRootCandidateList(profile);
+    for (let i = 0; i < list.length; i++) {
+        const el = document.querySelector(list[i]);
+        if (el && splitRootUsable(el)) return el
+    }
+    return null
+}
+function splitTagLeftRoot(root) {
+    if (_splitLeftRoot && _splitLeftRoot !== root) {
+        _splitLeftRoot.classList.remove(SPLIT_LEFT_CLASS);
+        _splitLeftRoot.removeAttribute('data-zhihuE-left');
+    }
+    _splitLeftRoot = root || null;
+    if (_splitLeftRoot) {
+        _splitLeftRoot.classList.add(SPLIT_LEFT_CLASS);
+        _splitLeftRoot.setAttribute('data-zhihuE-left', '1');   // F12 里一眼看出脚本认的是哪个容器
+    }
+}
+
+// —— 条目解析 ——
+// 从点击目标解析「它属于哪一条」。两条路：
+//   1) 适配表里的选择器（准、快）
+//   2) 结构兜底（知乎改版把语义类名换成 css-xxxx 哈希、或没登记过的新页面也能用）
+function splitResolveCard(target) {
+    const root = _splitLeftRoot;
+    if (!root || !root.isConnected) return null
+    if (!target || !target.closest || !root.contains(target)) return null
+    const cards = (_splitProfile && _splitProfile.cards) || [];
+    for (let i = 0; i < cards.length; i++) {
+        const el = target.closest(cards[i]);
+        if (el && el !== root && root.contains(el)) return el
+    }
+    return splitGuessCard(root, target)
+}
+
+// 结构兜底：先找「列表」，再取落点所在的那一项。
+// 列表的判据 = 直接子节点里 ≥80% 含指向知乎内容页的链接（信息流 / 热榜 / 专栏卡片都符合）。
+// 列表必然是落点的祖先，所以沿祖先链从近到远找、第一个命中的就是最内层列表，不必全量扫描。
+var SPLIT_CONTENT_LINK_SEL = 'a[href*="/question/"], a[href*="/answer/"], a[href*="/p/"], ' +
+    'a[href*="/column/"], a[href*="/zvideo/"], a[href*="/pin/"], a[href*="/roundtable/"]';
+// 同口径的正则版：给 splitItemInfo 判「这个 href 是不是指向知乎内容页」用
+var SPLIT_CONTENT_LINK_RE = /\/(question|answer|p|column|zvideo|pin|roundtable)\//;
+function splitLooksLikeCardList(el) {
+    const kids = el.children;
+    const n = kids.length;
+    if (n < 3 || n > 200) return false
+    let hit = 0;
+    for (let i = 0; i < n; i++) {
+        const k = kids[i];
+        if (k.querySelector && k.querySelector(SPLIT_CONTENT_LINK_SEL)) hit++;
+    }
+    return hit / n >= 0.8
+}
+function splitGuessCard(root, target) {
+    let n = target.parentElement, hops = 0, list = null;
+    while (n && n !== root && hops++ < 20) {
+        if (splitLooksLikeCardList(n)) { list = n; break }
+        n = n.parentElement;
+    }
+    if (!list) return null
+    n = target;
+    hops = 0;
+    while (n && n.parentElement !== list && hops++ < 12) n = n.parentElement;
+    if (!n || n === list || n === root) return null
+    // 太矮的不算条目（多半是列表里的分隔行 / 小标题）
+    if (n.getBoundingClientRect().height < 24) return null
+    return n
+}
+
+// 量出信息流容器距文档顶部的距离（= header 实际占的高度），写成 CSS 变量。
+// 不写死 52px：知乎 header 会随窗口宽度换行变高，写死会导致栏底被截断或留白。
+// 0.9.21 起窗口本身可滚：rect.top 是视口相对值，必须加回 scrollY 才是不随滚动变化的文档偏移。
+function splitMeasureTop() {
+    if (!document.documentElement.classList.contains(SPLIT_CLASS)) return
+    const container = _splitLeftRoot || document.querySelector('.Topstory-container');
+    let top = 52;
+    if (container && container !== document.body) {
+        const rectTop = Math.round(container.getBoundingClientRect().top + (window.pageYOffset || window.scrollY || 0));
+        if (isFinite(rectTop) && rectTop >= 0) top = rectTop;
+    } else if (container === document.body) {
+        // 兜底把 body 当左栏时改用 header 底边，否则右侧面板会盖住导航（fixed 元素的 rect 与滚动无关）
+        const h = document.querySelector('header.AppHeader') || document.querySelector('.AppHeader');
+        if (h) {
+            const bottom = Math.round(h.getBoundingClientRect().bottom);
+            if (isFinite(bottom) && bottom > 0) top = bottom;
+        }
+    }
+    if (top === _splitLastTop) return // 值没变就不写，避免与 ResizeObserver 互相触发
+    _splitLastTop = top;
+    document.documentElement.style.setProperty('--zhihuE-split-top', top + 'px');
+}
+
+// 打开双栏模式（幂等，可重复调用）
+// 【0.9.21】不再加 zhihu-unstick：窗口恢复滚动后，header 保持知乎原生的 fixed 吸顶才能一直可见，
+// 左栏内容从其下方开始（知乎自己会垫 body padding-top），右侧面板 top 也用它对齐。
+function splitViewOn() {
+    if (!document.body) return
+    splitInjectStyle();
+    window.scrollTo(0, 0);
+    document.documentElement.classList.add(SPLIT_CLASS);
+    splitMeasureTop();
+    // 类名生效后布局可能再变一次（header 从 fixed 回到文档流），补量一帧
+    requestAnimationFrame(splitMeasureTop);
+    splitGetPanel(true);
+    splitBindOnce();
+}
+
+// 关闭双栏模式：移类名 + 删面板，页面回到知乎原样
+function splitViewOff() {
+    document.documentElement.classList.remove(SPLIT_CLASS);
+    document.documentElement.style.removeProperty('--zhihuE-split-top');
+    _splitLastTop = -1;
+    _splitExpandToken++;
+    splitRestoreContent();             // 双栏关掉时左栏要还给知乎，别留着被脚本展开的正文
+    if (_splitCurrentItem) {
+        _splitCurrentItem.classList.remove('zhihuE-splitActive');
+        _splitCurrentItem = null;
+    }
+    const panel = document.getElementById(SPLIT_PANEL_ID);
+    if (panel) panel.remove();
+    _splitPanel = null;
+    // 左栏容器还给知乎：类名/属性留着的话，切到别的页面会误伤同名的元素
+    splitTagLeftRoot(null);
+    _splitProfile = null;
+    _splitStyleProfileKey = '';        // 清掉键，下个页面会重新注入它自己的适配样式
+}
+// ------
+// 当前页面是否受双栏管辖（0.9.12 起只有「推荐」）。判定完全由 SPLIT_PROFILES 决定。
+function isSplitHomePage() {
+    // 右侧面板内嵌的就是知乎自己的页面，子框架里一律不启用双栏（否则内嵌页会再套一层）
+    if (window.top !== window.self) return false
+    return !!splitProfileFor(location.hostname, location.pathname)
+}
+
+// 清空右侧面板，回到占位提示
+function splitClear() {
+    const panel = splitGetPanel(false);
+    if (!panel) return
+    _splitExpandToken++;               // 作废还在等待中的正文展开
+    splitRestoreContentSoon();         // 被脚本展开的正文一并收回（带重试）
+    if (_splitCurrentItem) {
+        _splitCurrentItem.classList.remove('zhihuE-splitActive');
+        _splitCurrentItem = null;
+    }
+    splitShowEmpty(panel);
+}
+
+// 面板回到空态：清快照、复位工具栏
+function splitShowEmpty(panel) {
+    panel = panel || splitGetPanel(false);
+    if (!panel) return
+    panel.classList.remove('zhihuE-modeClone');
+    panel.querySelector('.zhihuE-panelSnap').innerHTML = '';
+    const openLink = panel.querySelector('.zhihuE-panelOpen');
+    openLink.style.display = 'none';
+    openLink.removeAttribute('href');
+    panel.querySelector('.zhihuE-panelTitle').textContent = '内容预览';
+    const empty = panel.querySelector('.zhihuE-panelEmpty');
+    if (empty) empty.innerHTML = SPLIT_HINT_HTML;
+}
+
+// 把卡片克隆体整理成「可读快照」——目标是「默认全部展开」，不留任何需要点击的折叠态
+var SPLIT_COLLAPSE_CLASSES = [
+    'RichContent-inner',            // 回答正文的折叠容器（--collapsed 由类名控制）
+    'QuestionRichText',             // 问题描述
+    'ContentItem-content',
+    'PinItem-content',
+    'AnswerItem-content',
+    'Comments-container',
+    'Comments'
+];
+function splitPrepareClone(clone) {
+    // 1) 去掉重复 id，避免与页面上的原节点撞车
+    clone.removeAttribute('id');
+    clone.querySelectorAll('[id]').forEach(function (n) { n.removeAttribute('id') });
+
+    // 2) 克隆体里的 <script> 不会执行，删掉更干净
+    clone.querySelectorAll('script').forEach(function (n) { n.remove() });
+
+    // 3) 展开被折叠的正文：知乎靠 class 上的 --collapsed 加 max-height / line-clamp 限高，
+    //    这里把类名摘掉、限高清掉（内联样式也一并覆盖，因为有些模块是行内写死的）
+    clone.querySelectorAll('.RichContent-inner').forEach(function (n) {
+        n.classList.remove('RichContent-inner--collapsed');
+    });
+    SPLIT_COLLAPSE_CLASSES.forEach(function (cls) {
+        const re = new RegExp(cls + '(--|-)?collapsed\\S*', 'g');
+        clone.querySelectorAll('[class*="' + cls + '"]').forEach(function (n) {
+            const raw = n.getAttribute('class'); // 不能用 n.className：SVG 元素上它不是字符串
+            if (!raw) return
+            const next = raw.replace(re, cls);
+            if (next !== raw) n.setAttribute('class', next);
+        });
+    });
+    clone.querySelectorAll('[style*="max-height"], [style*="-webkit-line-clamp"]').forEach(function (n) {
+        const tag = n.tagName;
+        if (tag === 'IMG' || tag === 'SVG' || tag === 'VIDEO' || tag === 'CANVAS') return // 别动媒体元素自身的尺寸
+        n.style.setProperty('max-height', 'none', 'important');
+        n.style.setProperty('-webkit-line-clamp', 'unset', 'important');
+    });
+    // 折叠遮罩 / 「展开全文」按钮——展开后它们只剩一个渐变压条，直接删掉
+    clone.querySelectorAll(
+        '.ContentItem-showMore, .ContentItem-more, .ContentItem-expandButton, .ContentItem-moreText, ' +
+        '.ContentItem-collapsedText, .RichContent-collapsedText, .QuestionRichText-more, .QuestionRichText-collapsedText, ' +
+        '.ContentItem-collapseButton, .ContentItem-collapse, .CommentCollapseButton, ' +
+        '.QuestionRichText-collapse, [data-zop-retract-question], [data-zop-retract-comment]'
+    ).forEach(function (n) { n.remove() });
+
+    // 4) 链接一律新标签打开：克隆体上的按钮不会触发知乎的 React 事件，但 <a> 的原生跳转依然有效
+    clone.querySelectorAll('a[href]').forEach(function (a) {
+        const href = a.getAttribute('href') || '';
+        if (!href || href.charAt(0) === '#' || href.indexOf('javascript:') === 0) return
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+    });
+
+    // 5) 图片不走懒加载，避免面板里出现空白图
+    clone.querySelectorAll('img').forEach(function (img) {
+        img.loading = 'eager';
+        img.removeAttribute('data-lazy-status');
+    });
+}
+
+// 只抽正文：取出「阅读全文」所展开的那块富文本内容，其余（标题 / 作者 / 操作栏）一概不要。
+// 逐级降级，返回 null 表示这条没有可抽取的正文（视频 / 直播 / 纯外链卡片等）。
+// 注意：折叠态下知乎交给页面的正文是被截断的，调用方必须先等 splitExpandContent() 完成再调这里。
+function splitExtractContent(item) {
+    if (!item) return null
+    const clone = item.cloneNode(true);
+    clone.classList.remove('zhihuE-splitActive');
+    splitPrepareClone(clone);
+
+    const doc =
+        clone.querySelector('.RichContent-inner') ||    // 回答 / 文章正文容器（段落、图、代码都在里面）
+        clone.querySelector('.ContentItem-content') ||  // 部分卡片的正文容器
+        clone.querySelector('.RichText') ||             // 通用富文本
+        clone.querySelector('.QuestionRichText');       // 问题描述
+    if (!doc) return null
+
+    // 正文之外的零碎一律丢掉：标题与作者信息工具栏里已有，操作栏在只读快照里只是死按钮
+    doc.querySelectorAll(
+        '.ContentItem-title, .ContentItem-meta, .ContentItem-status, .ContentItem-time, ' +
+        '.ContentItem-actions, .RichContent-actions, .ContentItem-tag, .ContentItem-tags'
+    ).forEach(function (n) { n.remove() });
+    return doc
+}
+
+// 用原条目「当前」的正文刷新面板，尽量保住阅读位置。
+// 只应在原条目正处于展开态时调用 —— 折叠态下抽到的只有半截正文。
+function splitRefreshPanel(item) {
+    const panel = splitGetPanel(false);
+    if (!panel || !item || !document.documentElement.contains(item)) return
+    const snap = panel.querySelector('.zhihuE-panelSnap');
+    const old = snap.firstElementChild;   // 正文永远是第一个子节点
+    if (!old) return                       // 面板已被清空，或已经换成了别的条目
+    const fresh = splitExtractContent(item);
+    if (!fresh) return                     // 依旧抽不出正文：保持现有兜底形态，别把内容清空
+    const keepScroll = snap.scrollTop;
+    snap.replaceChild(fresh, old);
+    snap.scrollTop = keepScroll;
+}
+// ------
+// 在**原条目**上静默点击按钮：克隆体上的按钮是死的（React 事件委托绑在知乎自己的 root 上），
+// 要让知乎自己把正文展开（「阅读全文」），必须回到原节点上真点一次。
+
+function splitQuietClick(el) {
+    if (!el) return
+    _splitSuppressClick = true;
+    try { el.click(); } finally { _splitSuppressClick = false; }
+}
+
+// ========== 正文「阅读全文」自动展开（0.9.4）==========
+// 为什么必须在原条目上真点一次「阅读全文」：
+//   折叠态下知乎交给页面的正文本身就是被截断的那几段（不是单纯 CSS 限高），
+//   只摘 collapsed 类 / 覆盖 max-height 只能放开容器高度，拿不到被裁掉的部分。
+//   所以流程改成：原条目真正展开 → 等 React 渲染出全文 → 再克隆进右侧面板。
+// 代价：左侧那张卡片会被展开（预览期间保持展开，否则中途任何一次重新克隆都只能拿到截断正文）；
+// 切到下一条 / 清空面板 / 关闭双栏时，脚本会通过「收起」入口把它收回去。
+
+// 归一化文案：去掉空白与零宽字符（知乎按钮里常夹着 <svg>）
+function splitText(el) {
+    return (el.textContent || '').replace(/[\s\u200b-\u200f\ufeff]+/g, '');
+}
+
+var SPLIT_EXPAND_TEXT = /^(阅读全文|展开阅读全文|展开全文|显示全部|查看全部|展开|更多)$/;
+// 收回用的文案。刻意写成「收起 / 折叠 + 可选宾语」的白名单，而不是宽松的 /^收起/：
+// 后者会把评论区里的「收起评论」「收起回复」一并命中，误点会把评论收起来。
+var SPLIT_COLLAPSE_TEXT = /^(收起|收起全文|收起回答|收起文章|收起正文|折叠)$/;
+// 「阅读全文 / 收起」入口常见位置
+var SPLIT_TOGGLE_SELECTOR = '.ContentItem-more, .ContentItem-expandButton, .ContentItem-collapseButton, ' +
+    '.ContentItem-moreText, .QuestionRichText-more, [data-zop-retract-question], button, [role="button"]';
+
+// 找展开/收起入口。只认 button / [role=button] / 无 href 的容器 ——
+// 带 href 的入口点了会跳详情页，宁可放弃自动展开也不能让页面跳走。
+function splitFindToggle(item, re) {
+    if (!item) return null
+    // 收起类：知乎有专门的「收起回答」按钮（属性标记），优先按属性认，不依赖文案 ——
+    // 它可能只有图标、或文案随版本变。只用 retract-question，不用 retract-comment
+    // （后者是「收起评论」，点了会把评论区收起来，不是我们要动的对象）。
+    if (re === SPLIT_COLLAPSE_TEXT) {
+        const retract = item.querySelector('[data-zop-retract-question]');
+        if (retract) return retract
+    }
+    const list = item.querySelectorAll(SPLIT_TOGGLE_SELECTOR);
+    for (let i = 0; i < list.length; i++) {
+        const el = list[i];
+        const raw = el.textContent || '';
+        if (!raw || raw.length > 40) continue        // 这类按钮文案很短，超长的一定不是
+        if (el.tagName === 'A' && el.hasAttribute('href')) {
+            const href = el.getAttribute('href') || '';
+            if (href && href.charAt(0) !== '#' && href.indexOf('javascript:') !== 0) continue
+        }
+        const text = splitText(el);
+        if (text && text.length <= 10 && re.test(text)) return el
+    }
+    return null
+}
+
+// 展开原条目正文并等 React 把全文渲染出来。
+// 返回 Promise<boolean>：true = 正文确实变了，调用方要用新快照刷新面板
+function splitExpandContent(item) {
+    return new Promise(function (resolve) {
+        if (!item || !document.documentElement.contains(item)) { resolve(false); return }
+        const btn = splitFindToggle(item, SPLIT_EXPAND_TEXT);
+        if (!btn) { resolve(false); return }         // 没有折叠入口：正文本来就是全的，不必刷新
+
+        // 拿正文容器的当前文本长度作为「内容真的变多了」的基准
+        const box = item.querySelector('.RichText') || item.querySelector('[class*="RichContent"]') || item;
+        const beforeLen = (box.textContent || '').length;
+
+        _splitExpandedItem = item;
+        splitQuietClick(btn);
+
+        let waited = 0;
+        const timer = setInterval(function () {
+            if (!document.documentElement.contains(item)) { clearInterval(timer); resolve(false); return }
+
+            // 判定「全文已经渲染进 DOM」。因为调用方拿到结果后会**立刻把左侧收回折叠**，
+            // 这里是这一轮唯一的抽取时机 —— 判早了就只能抽到半截，没有第二次机会，
+            // 所以判定必须从严：优先认「正文文本确实变长了」这个最直接的信号，
+            // 再用「展开按钮消失 **且** 折叠类名被摘掉」（两个都要，不能是或）兜住内容没变长的情况。
+            const nowLen = (box.textContent || '').length;
+            const btnGone = !splitFindToggle(item, SPLIT_EXPAND_TEXT);
+            const noCollapsed = !item.querySelector('[class*="collapsed"], [class*="Collapsed"]');
+            if (nowLen > beforeLen || (btnGone && noCollapsed)) { clearInterval(timer); resolve(true); return }
+
+            waited += 120;
+            // 超时仍按「已展开」交付：让调用方再抽一次当前状态，抽到全文最好，
+            // 抽到的仍是半截也只是维持现状，总好过因为判定没命中而彻底不刷新。
+            if (waited >= 2400) { clearInterval(timer); resolve(true) }
+        }, 120);
+    })
+}
+
+// 立即收回（单次尝试，不重试）：清空 / 关闭双栏时用 —— 这两个场景之后不再有 UI 动作，
+// 留一个重试定时器没有意义。
+function splitRestoreContent() {
+    splitClearRestoreQueue();
+    const prev = _splitExpandedItem;
+    _splitExpandedItem = null;
+    if (!prev || !document.documentElement.contains(prev)) return
+    const btn = splitFindToggle(prev, SPLIT_COLLAPSE_TEXT);
+    if (btn) splitQuietClick(btn);
+}
+
+// 尽快收回（带重试）：切换条目时用 —— 上一条的「收起」入口可能还没渲染出来，
+// 给它几百毫秒的重试窗口，别像 0.9.7 那样一次没找到就永久留着展开。
+function splitRestoreContentSoon() {
+    const prev = _splitExpandedItem;
+    _splitExpandedItem = null;
+    if (!prev || !document.documentElement.contains(prev)) return
+    splitScheduleRestore(prev, 0);
+}
+
+// —— 延时收回 ——
+//
+// 【2026-09-25 修复 · P0】0.9.7 在正文抽完后立刻调 splitRestoreContent()，实测真实知乎上收不回去。
+// 原因：条目被点开「阅读全文」后，「收起」入口是 React 后续渲染出来的，展开动作完成的那一瞬间
+// 它往往还不存在 → splitFindToggle(..., SPLIT_COLLAPSE_TEXT) 返回 null → 静默什么都不做。
+// （mock 里收起按钮是同步生成的，所以离线测试一直是绿的，掩盖了这个问题。）
+//
+// 现在改为「延时 + 重试」：入队 → 等 3 秒（见 splitShowClone 调用处）→ 找「收起」入口，
+// 没出现就按 SPLIT_RESTORE_RETRY 间隔再试，最多 SPLIT_RESTORE_RETRY_MAX 次；仍没有就放弃（保持展开）。
+// 用队列而不是单个定时器，是为了让「切到新条目」时旧条目仍能被收回 —— 两者互不干扰。
+var SPLIT_RESTORE_RETRY = 200;        // 找不到「收起」入口时的重试间隔（毫秒）
+var SPLIT_RESTORE_RETRY_MAX = 10;     // 最多重试次数（合计约 2s，覆盖渲染较慢的情况）
+var _splitRestoreQueue = [];          // [{item, due, tries}] 待收回的条目
+var _splitRestoreTimer = null;
+
+function splitScheduleRestore(item, delay) {
+    if (!item) return
+    const due = Date.now() + (delay || 0);
+    for (let i = 0; i < _splitRestoreQueue.length; i++) {
+        if (_splitRestoreQueue[i].item === item) {
+            // 同一条已在队列里（它自己的延时任务先排上了）：
+            // 只把时间往前挪，不能直接 return —— 否则「切换条目 / 清空」发起的
+            // 「尽快收回」会被已排好的 3 秒延时吞掉，条目要等到原定时刻才收回。
+            if (due < _splitRestoreQueue[i].due) _splitRestoreQueue[i].due = due;
+            splitStartRestorePump();
+            return
+        }
+    }
+    _splitRestoreQueue.push({ item: item, due: due, tries: 0 });
+    splitStartRestorePump();
+}
+
+function splitStartRestorePump() {
+    if (_splitRestoreTimer) return
+    _splitRestoreTimer = setInterval(splitRestorePumpTick, SPLIT_RESTORE_RETRY);
+}
+
+function splitStopRestorePump() {
+    if (_splitRestoreTimer) { clearInterval(_splitRestoreTimer); _splitRestoreTimer = null; }
+}
+
+// 清空所有待收回安排（清空面板 / 关闭双栏时调用，避免离开场景后还在点按钮）
+function splitClearRestoreQueue() {
+    _splitRestoreQueue = [];
+    splitStopRestorePump();
+}
+
+function splitRestorePumpTick() {
+    if (!_splitRestoreQueue.length) { splitStopRestorePump(); return }
+    const now = Date.now();
+    const keep = [];
+    for (let i = 0; i < _splitRestoreQueue.length; i++) {
+        const entry = _splitRestoreQueue[i];
+        if (!entry.item || !document.documentElement.contains(entry.item)) continue  // 条目已离开页面：丢弃
+        if (now < entry.due) { keep.push(entry); continue }                          // 还没到点：继续等
+        const btn = splitFindToggle(entry.item, SPLIT_COLLAPSE_TEXT);
+        if (btn) {                                                                   // 找到「收起」入口：点它
+            if (_splitExpandedItem === entry.item) _splitExpandedItem = null;
+            splitQuietClick(btn);
+            continue
+        }
+        entry.tries++
+        if (entry.tries <= SPLIT_RESTORE_RETRY_MAX) keep.push(entry);                // 还没渲染出来：下轮再试
+    }
+    _splitRestoreQueue = keep;
+    if (!_splitRestoreQueue.length) splitStopRestorePump();
+}
+
+// ------
+// 从条目里取「标题 + 主链接」。原来是写死的 .ContentItem-title，热榜 / 专栏的卡片
+// 用的是 .HotItem-title / .ArticleItem-title 之类，取不到就会变成一张只有标题的空白快照，
+// 所以这里改成「按提示依次找，最后退到卡片里第一个指向知乎内容页的链接」。
+var SPLIT_TITLE_HINTS = [
+    '.ContentItem-title', '.HotItem-title', '.ArticleItem-title', '.ColumnHomeColumnCard-title',
+    '.ColumnSquareItem-title', '.Post-Title', 'h2', 'h3'
+];
+function splitItemInfo(item) {
+    let title = '';
+    let url = '';
+    for (let i = 0; i < SPLIT_TITLE_HINTS.length; i++) {
+        const el = item.querySelector(SPLIT_TITLE_HINTS[i]);
+        if (!el) continue
+        const a = (el.tagName === 'A') ? el : el.querySelector('a[href]');
+        if (!url && a && a.href) url = a.href;
+        if (!title) {
+            // 标题文字优先取元素自身的文本。这里刻意不用 splitText（它会把空格全删掉，
+            // 中英混排的标题会变成一坨），改成「折叠连续空白」。
+            // 另外热榜那种「整条内容都包在一个 <a> 里」的，直接取 <a> 文本会把摘要也吃进来，所以要截断
+            title = ((el.textContent || '').replace(/\s+/g, ' ').trim()).slice(0, 60);
+        }
+        if (title && url) break
+    }
+    if (!url) {
+        // 兜底：卡片里第一个「指向知乎内容页、且文字不是空」的链接
+        const as = item.querySelectorAll('a[href]');
+        for (let i = 0; i < as.length; i++) {
+            const href = as[i].getAttribute('href') || '';
+            if (SPLIT_CONTENT_LINK_RE.test(href) && splitText(as[i]) && !url) {
+                url = as[i].href;
+                if (!title) title = ((as[i].textContent || '').replace(/\s+/g, ' ').trim()).slice(0, 60);
+                break
+            }
+        }
+    }
+    if (!url) {
+        const meta = item.querySelector('meta[itemprop="url"]');
+        if (meta && meta.content) url = meta.content;
+    }
+    return { title: title, url: url }
+}
+
+// 面板工具栏：标题 + 「在新标签打开」链接
+function splitSetPanelHead(panel, info) {
+    panel.querySelector('.zhihuE-panelTitle').textContent = info.title || '内容预览';
+    const openLink = panel.querySelector('.zhihuE-panelOpen');
+    if (info.url) {
+        openLink.href = info.url;
+        openLink.style.display = '';
+    } else {
+        openLink.style.display = 'none';
+        openLink.removeAttribute('href');
+    }
+}
+
+// 在右侧面板里展示某条信息流内容（同一时间只保留一条）。
+// 渲染路线固定为「只抽取正文」（原 menu_homeSplitFrame 开关恒为 false，iframe 内嵌链路已随 0.9.14 重构删除）。
+function splitShow(item) {
+    if (!item) return
+    const panel = splitGetPanel(true);
+    if (!panel) return
+    if (_splitCurrentItem === item) {          // 重复点同一条：把右侧滚回顶部即可
+        splitScrollPanelTop(panel);
+        return
+    }
+
+    _splitExpandToken++;              // 作废上一条还在等待中的正文展开
+    splitRestoreContentSoon();        // 把上一条被脚本展开的正文收回去（带重试，见其注释）
+    if (_splitCurrentItem) _splitCurrentItem.classList.remove('zhihuE-splitActive');
+    _splitCurrentItem = item;
+    item.classList.add('zhihuE-splitActive');
+
+    const info = splitItemInfo(item);
+    splitSetPanelHead(panel, info);
+
+    splitShowClone(panel, item);
+}
+
+// 重复点同一条时把右侧滚回顶部
+function splitScrollPanelTop(panel) {
+    panel.querySelector('.zhihuE-panelSnap').scrollTop = 0;
+}
+
+// —— 渲染路线 B：只抽取正文（默认路线）——
+// 折叠态下知乎交给页面的正文是被截断的，所以要拿到全文必须先在原条目上真正点一次「阅读全文」，
+// 等 React 渲染完，再把正文区块抽出来放进右栏。
+// 为什么不像 0.9.5 那样用 iframe 内嵌原页：实测内嵌页宽度压不住，会带出横向滚动条。
+function splitShowClone(panel, item) {
+    panel.classList.add('zhihuE-modeClone');
+
+    splitPaintDoc(panel, item);          // 先把当前这版正文画出来当即时反馈
+
+    const token = _splitExpandToken;
+    splitExpandContent(item).then(function (changed) {
+        if (token !== _splitExpandToken) return      // 期间又切了别的条目，这次结果作废
+        if (_splitCurrentItem !== item) return
+
+        // 正文替换为「阅读全文」后的完整内容
+        if (changed) splitRefreshPanel(item);
+        // 抽正文是同步克隆，内容此刻已经进了面板，与左侧节点后续状态无关 ——
+        // 所以可以着手把左侧那张卡片收回去。
+        // 但**不能立刻收**：条目的「收起」入口是 React 异步补上的，展开刚完成时还不存在，
+        // 立刻找必然落空（0.9.7 就是这么静默失败的）。改为延后 3 秒（见下一行）再收，
+        // 并由 splitRestorePumpTick 负责找不到时重试。
+        // （顺序仍必须是先抽后收：反了就只能抽到半截。）
+        splitScheduleRestore(item, 3000); // 原 menu_homeSplitCollapseDelay：抽完隔多久收回左侧卡片（毫秒，0 = 立即）
+    });
+}
+
+// 把某条目的正文画进面板：抽得到正文就只放正文；抽不到（视频 / 直播 / 纯外链卡片）退回整条快照，保证不空白
+function splitPaintDoc(panel, item) {
+    const snap = panel.querySelector('.zhihuE-panelSnap');
+    snap.innerHTML = '';
+    const doc = splitExtractContent(item);
+    if (doc) {
+        snap.appendChild(doc);
+    } else {
+        const clone = item.cloneNode(true);
+        clone.classList.remove('zhihuE-splitActive');
+        splitPrepareClone(clone);
+        snap.appendChild(clone);
+    }
+    snap.scrollTop = 0;
+}
+
+// 点击左侧条目 → 右侧展示。捕获阶段拦下来，抢在知乎自己的委托处理之前。
+// 例外：
+//   · 标题链接 / 「直达问题」按钮 —— 不预览，直接在新标签页打开原页（见下面的 target=_blank 判定）
+//   · 卡片上的按钮 / 输入框 / 视频 —— 赞同、评论、关注、展开全文、播放器等必须保持可用
+//   · 正在划选文字 —— 避免「选完一段话顺手把预览切了」
+//   · 脚本自己发起的点击（展开正文等）—— 由 _splitSuppressClick 挡掉，否则会被自己二次拦截
+function splitOnClick(event) {
+    if (_splitSuppressClick) return                                 // 脚本自身发起的 click，不做任何拦截
+    if (event.button !== 0) return                                  // 只处理左键
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return // 组合键保持原生「新标签打开」
+    if (!document.documentElement.classList.contains(SPLIT_CLASS)) return
+
+    const target = event.target;
+    if (!target || !target.closest) return
+    const panel = splitGetPanel(false);
+    if (panel && panel.contains(target)) return                      // 面板内部的点击不处理
+
+    // 左栏容器被知乎换掉了（SPA 换页 / 重新渲染）：先重新同步一次，这一击不拦，免得落空后白点
+    if (!_splitLeftRoot || !_splitLeftRoot.isConnected) { splitViewSyncSoon(); return }
+
+    const item = splitResolveCard(target);
+    if (!item) return
+
+    if (target.closest('button, input, select, textarea, label, [contenteditable="true"], video, audio')) return
+
+    // 「阅读全文 / 收起」在知乎也可能是 role=button 的 div —— 一并放行，否则用户点不动它
+    const toggle = target.closest('[role="button"], .ContentItem-more, .ContentItem-expandButton, .ContentItem-collapseButton');
+    if (toggle && (SPLIT_EXPAND_TEXT.test(splitText(toggle)) || SPLIT_COLLAPSE_TEXT.test(splitText(toggle)))) return
+
+    const selection = window.getSelection && window.getSelection();
+    if (selection && !selection.isCollapsed && String(selection).length > 0) return
+
+    // 标题链接 / 直达问题：按要求在新标签页打开，不在右侧预览。
+    // 之所以自己 window.open 而不是放行原生点击：知乎的 React 委托会接管左键跳转，放行就变成当前页打开了。
+    // 只在「信息流」类页面这么做 —— 热榜 / 专栏的条目整条本来就是一个链接，
+    // 再区分「标题」等于一半点开新标签、一半点出预览，反而更难用（titleNewTab 见 SPLIT_PROFILES）。
+    const newTabLink = (!_splitProfile || _splitProfile.titleNewTab !== false) ? splitNewTabLink(target) : '';
+    if (newTabLink) {
+        event.preventDefault();
+        event.stopPropagation();
+        window.open(newTabLink, '_blank', 'noopener,noreferrer');
+        return
+    }
+
+    event.preventDefault();                                          // 阻断卡片上链接的默认跳转
+    event.stopPropagation();
+    splitShow(item);
+}
+
+// 命中「应在新标签页打开」的链接，返回绝对 URL；不是则返回空
+function splitNewTabLink(target) {
+    const a = target.closest('a[href]');
+    if (!a) return ''
+    if (a.classList.contains('zhihu_e_toQuestion') || a.closest('.ContentItem-title')) {
+        const href = a.href || '';
+        if (!href || href.indexOf('javascript:') === 0 || href.charAt(0) === '#') return ''
+        return href
+    }
+    return ''
+}
+
+// 全局只绑定一次：点击、窗口尺寸变化
+function splitBindOnce() {
+    if (_splitBound) return
+    _splitBound = true;
+
+    document.addEventListener('click', splitOnClick, true);
+
+    window.addEventListener('resize', function () { splitMeasureTop() }, { passive: true });
+    window.addEventListener('urlchange', function () { splitMeasureTop() });
+    // header 高度会随宽度换行变化，观测根元素尺寸比 resize 更可靠（含缩放、滚动条出现等情形）
+    if (window.ResizeObserver) {
+        new ResizeObserver(function () { splitMeasureTop() }).observe(document.documentElement);
+    }
+    // 【0.9.21】旧的「左栏滚到底给 window 补发 scroll」补丁已删：滚动归还窗口后，
+    // 知乎的无限加载走原生窗口滚动，不再需要任何转发。
+}
+
+// 唯一对外入口：按当前 URL 与配置决定开 / 关。SPA 切页（urlchange）时反复调用。
+var _splitLastPath = '';
+function splitViewSync() {
+    const profile = splitProfileFor(location.hostname, location.pathname);
+    if (!profile) {                      // 不归双栏管：彻底还原，保证「改动只作用于这几个页面」
+        splitViewOff();
+        _splitLastPath = '';
+        return
+    }
+    // menu_homeSplitView 固定开启（0.9.14 内联 CONFIG），不存在关闭路径；
+    // 0.9.21 起 header 保持知乎原生 fixed 吸顶（不再打 zhihu-unstick，见 splitViewOn 注释）
+    splitInjectStyle();
+
+    // 找不到「够大的左栏容器」就不开，并安排有限次重试 —— 例如 SPA 刚切到 /hot、内容还没渲染出来。
+    // 宁缺勿滥的原因见 splitRootCandidateList 注释：硬开会让整个页面滚不动。
+    const root = splitFindLeftRoot(profile);
+    if (!root) {
+        splitViewOff();
+        splitRetryForRoot();
+        return
+    }
+    _splitProfile = profile;
+
+    const key = profile.key + '@' + location.hostname + location.pathname;
+    const changed = _splitLastPath !== key;   // 换页了（0.9.12 起只有「推荐」，这里主要是首次进入）
+    _splitLastPath = key;
+
+    splitInjectProfileStyle(profile);
+    splitTagLeftRoot(root);
+    splitViewOn();
+    if (changed) splitClear();
+}
+
+// 页面容器是异步渲染的，切过去时可能还不存在；找不到就有限次重试，找到即停。
+// 有限次是为了不在不支持的页面上留一个常驻定时器。
+var _splitRootRetry = 0;
+var _splitRootTimer = null;
+function splitRetryForRoot() {
+    if (_splitRootTimer) return
+    _splitRootRetry = 0;
+    _splitRootTimer = setInterval(function () {
+        _splitRootRetry++;
+        const stop = _splitRootRetry > 20                                  // 最多等约 8 秒
+            || document.documentElement.classList.contains(SPLIT_CLASS)    // 已经开起来了
+            || !isSplitHomePage();                                        // 又切走了
+        if (stop) { clearInterval(_splitRootTimer); _splitRootTimer = null; return }
+        splitViewSync();
+    }, 400);
+}
+
+// 首页判定用的是 location.pathname，而 SPA 换页后新 DOM 会稍晚就绪，所以延后再同步一次
+var _splitSyncTimer = null;
+function splitViewSyncSoon() {
+    splitViewSync();
+    clearTimeout(_splitSyncTimer);
+    _splitSyncTimer = setTimeout(splitViewSync, 300);
+}
+// ========== 首页双栏相关函数 结束 ==========
+
+// 去掉页头导航项自带的点击事件，改成静态链接
+// 针对所有页面
+// 【0.9.16】原先配套的 switchHomeRecommend()（给「推荐」导航项拦点击 + 写 cookie + 强制刷新）
+// 随「推荐」导航项一并删除：入口都隐藏了，拦截逻辑成了死代码。
+function switchHome() {
+    document.querySelectorAll('header.AppHeader nav').forEach((a)=>{a.outerHTML = a.outerHTML;})
+}
+
+// ========== 页头导航精简（0.9.12 引入，0.9.16 起导航项全部隐藏）==========
+// 需求演进：0.9.12 隐藏「关注 / 热榜 / 专栏 / 圈子 / AI Works / 故事」只留「推荐」；
+// 0.9.16 按 new 需求把「推荐」也隐藏 —— 至此导航容器里不再保留任何条目，
+// 页头只余 logo、搜索等非导航元素（这些不在 nav 容器里，本模块碰不到）。
+//
+// 【为什么用「文案 + href」双轨判定】
+//   只认 href —— 知乎改路径（/hot 换个名字）就失效；
+//   只认文案 —— 知乎把文字换成图标或英文名就失效。
+//   两条任一命中即隐藏；两条都不命中就**一律不动** —— 不去猜「该隐藏谁」：
+//   header 里还有 logo、搜索、消息、创作中心，无差别隐藏会误伤。
+// 【为什么每 800ms 复查一次】知乎是 SPA，切栏目时导航会被 React 整体重建（类名随之丢失），
+//   而且 switchHome() 自己也会用 outerHTML 把 nav 重建一次。复查是幂等的（已隐藏的直接跳过），代价可忽略。
+var NAV_HIDE_CLASS = 'zhihuE-navHidden';
+// 文案口径：splitText() 已去掉全部空白与零宽字符，这里再统一小写，兼容「AI Works / AIWorks / ai works」。
+// 【2026-09-26 修复】知乎给该入口加了「Beta」角标（文案「AI WorksBeta」→ 规范化 aiworksbeta），
+// 精确匹配漏网 → 对拉丁类条目再走一遍前缀匹配（NAV_HIDE_TEXT_PREFIX），后缀怎么变都能盖住。
+// 「首页」是「推荐」在旧版知乎里的文案，一并收进防止改版回退
+var NAV_HIDE_TEXT = { '关注': 1, '热榜': 1, '专栏': 1, '圈子': 1, 'aiworks': 1, '故事': 1, '推荐': 1, '首页': 1 };
+var NAV_HIDE_TEXT_PREFIX = ['aiworks'];   // 前缀命中即隐藏（兼容 Beta / v2 等任意后缀）
+// 路径口径：末尾斜杠先归一化（'/hot/' 与 '/hot' 等价），作为改文案时的兜底
+// '/'（推荐 / 首页）⚠️ 只在 nav 容器内安全；header 兜底扫描里 logo 的 href 也是 '/'，
+// 所以 navHideInHeader() 对 logo 类锚点做了排除，见该函数注释。
+var NAV_HIDE_PATH = {
+    '/': 1,               // 推荐（首页）
+    '/follow': 1,         // 关注
+    '/hot': 1,            // 热榜
+    '/column-square': 1,  // 专栏
+    '/ring-feeds': 1,     // 圈子
+    '/ai-works': 1,       // AI Works（旧路径，防回退）
+    '/project-square': 1, // AI Works（2026-09 实测真实路径）
+    '/story': 1           // 故事
+};
+// 导航容器：知乎不同版本分别用过 <nav> 与 div.AppHeader-nav，逐个试，命中就用
+var NAV_ROOT_SELECTORS = ['header.AppHeader nav', 'header.AppHeader .AppHeader-nav', '.AppHeader nav', '.AppHeader .AppHeader-nav'];
+
+function navInjectStyle() {
+    injectStyle('zhihuE-navStyle', '.AppHeader .' + NAV_HIDE_CLASS + ' {display: none !important;}');
+}
+
+// 只按**路径**判定该不该隐藏（文案判定见 navShouldHide）。
+// 单拆出来是因为下面的 header 兜底路径只敢用这一条：header 右侧有些按钮的文字里也可能含「关注」，
+// 文案匹配放在 header 全域会误伤，路径匹配则足够精确。
+function navHideByPath(el) {
+    const href = el.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#' || href.indexOf('javascript:') === 0) return false
+    let u;
+    try { u = new URL(href, location.origin) } catch (e) { return false }
+    if (!splitHostOk(u.hostname)) return false          // 只认知乎站内，外链一律不动
+    const path = u.pathname.replace(/\/+$/, '') || '/';
+    return !!NAV_HIDE_PATH[path]
+}
+
+// 这个导航项该不该隐藏：文案与路径任一命中即隐藏
+function navShouldHide(el) {
+    const text = splitText(el).toLowerCase();
+    if (text && NAV_HIDE_TEXT[text]) return true;
+    // 前缀匹配：兜住「AI WorksBeta」这类带角标后缀的条目
+    for (let i = 0; i < NAV_HIDE_TEXT_PREFIX.length; i++) {
+        if (text.indexOf(NAV_HIDE_TEXT_PREFIX[i]) === 0) return true
+    }
+    return navHideByPath(el)
+}
+
+// 兜底：知乎若把导航项直接摊在 header 里（没套 nav 容器），按路径匹配一次。
+// 这种结构下只认路径 —— 见 navHideByPath 的说明。
+// ⚠️ NAV_HIDE_PATH 里有 '/'（推荐），而 logo 的 href 同样指向 '/'：
+// 必须排除 logo 类锚点，否则无 nav 容器的页面会把 logo 一起藏掉。
+function navHideInHeader() {
+    const header = document.querySelector('header.AppHeader') || document.querySelector('.AppHeader');
+    if (!header) return
+    const list = header.querySelectorAll('a[href]');
+    for (let i = 0; i < list.length; i++) {
+        const el = list[i];
+        // logo 识别三重保险：官方类名 / 内含图片 / aria-label
+        if (el.classList.contains('AppHeader-logo') || el.querySelector('img') || el.getAttribute('aria-label') === '知乎') continue
+        if (!el.classList.contains(NAV_HIDE_CLASS) && navHideByPath(el)) el.classList.add(NAV_HIDE_CLASS);
+    }
+}
+
+// 幂等：重复调用只是给同一个节点重复加同一个类名，不会累积状态
+function simplifyHeaderNav() {
+    navInjectStyle();                                  // CSS 必须先注入，否则加类名也不生效
+    const roots = document.querySelectorAll(NAV_ROOT_SELECTORS.join(','));
+    if (!roots.length) { navHideInHeader(); return }
+    for (let r = 0; r < roots.length; r++) {
+        const kids = roots[r].children;
+        for (let i = 0; i < kids.length; i++) {
+            const node = kids[i];
+            if (!node || node.classList.contains(NAV_HIDE_CLASS)) continue
+            // 条目可能是 <a> 本身，也可能外面还套了一层容器；
+            // 容器里没有 <a> 时退回容器自身（此时只按文案判，href 判定自然落空）
+            const a = (node.tagName === 'A') ? node : node.querySelector('a[href]');
+            if (!navShouldHide(a || node)) continue
+            node.classList.add(NAV_HIDE_CLASS);
+        }
+    }
+}
+
+// 隐藏写回答 / 写想法编辑区（div.WriteArea）。
+// 用 CSS 隐藏而不是删 DOM：这块区域由 React 管理节点，真删会在后续卸载/重渲染时报错；
+// 一条 CSS 规则对 SPA 重建出来的新节点天然持续生效，不用轮询。
+function hideWriteArea() {
+    injectStyle('zhihuE-hideWriteArea', '.WriteArea{display:none !important;}');
+}
+
+// ========== 推荐流赞同数过滤（0.9.17；0.9.19 修渲染竞态误杀）==========
+// 需求：首页「推荐」流只展示赞同数 ≥ 10 的内容；「问题」类卡片本身没有赞同数（问题不带赞同，
+// 只有回答才有），一并隐藏（许老师 2026-09-26 确认口径：≥10 显示，读不到赞同数的隐藏）。
+// 只做 DOM 级隐藏：不动知乎的排序，也不影响「加载更多」——无限滚动由接口 offset 驱动，
+// 与视口里可见条目数无关，藏掉卡片不会让分页提前或错乱。
+// 手法与导航模块一致：加类名 + 注入一条 CSS；React 重建节点后类名丢失，下一轮复查重新打上，天然幂等。
+//
+// 0.9.19 关键修复：知乎推荐流卡片是渐进渲染，首评时「赞同」按钮的数字常还没填进去，
+// 旧逻辑「按钮在但读不到数字 → 按 0 赞同藏，且藏了就永久跳过」会造成连锁灾难——
+// 新卡片被误杀 → 列表可见内容变空 → 知乎无限滚动不停请求下一页 → 新卡片又被误杀 →
+// 页面表现为「左侧内容不断刷新、什么都显示不出来」。现改为：
+//   ① 按钮在但三处都读不到数字 → 先给 3 秒宽限期（大概率是数字还没渲染），超时仍读不到才按 0 赞同隐藏；
+//   ② 每轮全量重评（不再对已藏条目短路跳过），测出真实赞同数 ≥ 阈值就移除隐藏类（误杀平反）。
+var FEED_MIN_VOTEUP = 10;
+var FEED_HIDE_CLASS = 'zhihuE-voteHidden';
+// 「按钮在但读不到数字」的宽限期：覆盖渐进渲染的数字填充间隔
+var FEED_NOREAD_GRACE_MS = 3000;
+// item -> 首次「按钮无数字」的时间戳；WeakMap 持引用，卡片被 React 回收后自动清理
+var _feedNoReadSeen = new WeakMap();
+
+function feedVoteInjectStyle() {
+    injectStyle('zhihuE-feedVoteStyle', '.TopstoryItem.' + FEED_HIDE_CLASS + ' {display: none !important;}');
+}
+
+// 「赞同 1.2 万」→ 12000；「赞同 23」→ 23；读不到数字 → -1（-1/-2/≥0 的语义区分见 feedVoteUpOf）
+function feedParseVoteUp(text) {
+    const t = String(text || '').replace(/,/g, '');
+    const wan = t.match(/([\d.]+)\s*万/);
+    if (wan) return Math.round(parseFloat(wan[1]) * 10000)
+    const num = t.match(/\d+/);
+    return num ? parseInt(num[0], 10) : -1
+}
+
+// 单条卡片的赞同数，三种返回：
+//   -1：没有赞同按钮（「问题」类卡片）→ 立即隐藏（口径已确认）；
+//   ≥0：按钮上读到了真实赞同数字；
+//   -2：按钮在但本体 / aria-label / title 三处都读不到数字 —— 可能是 0 赞同（按钮只写「赞同」），
+//       也可能只是数字还没渲染完，交给宽限期裁决，不在此处下定论
+// 0.9.19 重大修正：真实页（2026-09-26 实测）赞同按钮是 button.VoteButton，**未赞同态没有
+// --up 修饰类**（VoteButton--up 只在「已赞同」态出现），旧选择器 .VoteButton--up 全部落空，
+// 导致所有卡片被误判成「问题卡」整体隐藏，是「无限刷新」事故的第一根因。取：
+//   button.VoteButton 且排除 .VoteButton--down（反对钮）；限 button 标签是为了躲开脚本
+//   自建的 a.zhihu_e_toQuestion「直达问题」链接（它也借用了 VoteButton 类名）。
+function feedVoteUpOf(item) {
+    const btn = item.querySelector('button.VoteButton:not(.VoteButton--down)');
+    if (!btn) return -1
+    const sources = [btn.textContent, btn.getAttribute('aria-label'), btn.getAttribute('title')];
+    for (let i = 0; i < sources.length; i++) {
+        const v = feedParseVoteUp(sources[i]);
+        if (v >= 0) return v
+    }
+    return -2
+}
+
+// 每轮全量重评 .TopstoryItem（800ms 一轮）：不能对已藏条目短路跳过——
+// 那会让渲染竞态期间的误杀永久化，是 0.9.18「无限刷新」事故的另一半根因
+function feedVoteFilter() {
+    if (location.pathname !== '/') return          // 只作用于推荐流，其它页面（热榜 / 问题页…）一律不动
+    feedVoteInjectStyle();
+    const items = document.querySelectorAll('.TopstoryItem');
+    const now = Date.now();
+    for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        // 操作栏还没渲染出来的条目先跳过（懒加载期间贸然判「无赞同数」会误杀），等下一轮复查
+        if (!item.querySelector('.ContentItem-actions')) continue
+        const v = feedVoteUpOf(item);
+        if (v === -2) {
+            // 宽限期内不动；超时仍读不到数字才按「0 赞同」隐藏
+            if (!_feedNoReadSeen.has(item)) { _feedNoReadSeen.set(item, now); continue }
+            if (now - _feedNoReadSeen.get(item) < FEED_NOREAD_GRACE_MS) continue
+            item.classList.add(FEED_HIDE_CLASS);
+        } else if (v >= FEED_MIN_VOTEUP) {
+            // 达标：正常展示；若此前被误藏（渲染竞态误杀），这一步即平反
+            item.classList.remove(FEED_HIDE_CLASS);
+        } else {
+            // -1（问题卡）或明确的 0 ≤ v < 10：隐藏
+            item.classList.add(FEED_HIDE_CLASS);
+        }
+    }
+}
+
+(function() {
+    if (window.onurlchange === undefined) {addUrlChangeEvent();} // Tampermonkey v4.11 版本添加的 onurlchange 事件 grant，可以监控 pjax 等网页的 URL 变化
+
+    copySanitize(); // 剪贴板消毒（尽早注册复制事件，避免延迟期间复制不生效）
+    hideWriteArea(); // 隐藏写回答/写想法编辑区（CSS 规则一次注入、全程生效）
+    layoutFullWidth(); // 布局：隐藏首页/问题页的右侧栏，主内容占满宽度（尽早注入，避免样式跳一下）
+    splitViewSync(); // 首页 50/50 双栏（0.9.21 起不锁窗口，header 保持原生吸顶；同样尽早，避免样式跳一下）
+    window.addEventListener('urlchange', splitViewSyncSoon); // 首页 ⇄ 其他页切换时开/关双栏
+    // Violentmonkey 比 Tampermonkey 加载更早，会导致一些元素还没加载，因此需要延迟一会儿
+    // Tampermonkey 4.18.0 版本可能需要延迟一会执行
+    if (GM_info.scriptHandler === 'Violentmonkey' || (GM_info.scriptHandler === 'Tampermonkey' && parseFloat(GM_info.version.slice(0,4)) >= 4.18)) {
+        setTimeout(start, 200);
+    } else {
+        start();
+    }
+
+    function start(){
+        switchHome(); // 去掉页头导航项自带的点击事件，改成静态链接（它会把 nav 重建一次，所以下面紧接着补隐藏）
+        simplifyHeaderNav(); // 页头导航项全部隐藏（含「推荐」，见 NAV_HIDE_TEXT / NAV_HIDE_PATH）
+        setInterval(simplifyHeaderNav, 800); // 知乎是 SPA，导航可能被整体重建，定期做一次幂等补隐藏
+        cleanHighlightLink(); //                                               移除高亮链接
+        originalPic();directLink(); // 先立即执行一次
+        setInterval(originalPic,500); //                                       默认高清原图（无水印）
+        setInterval(directLink, 500); //                                       默认站外直链
+        if (location.hostname != 'zhuanlan.zhihu.com') {
+            collapsedAnswer(); //                                              一键收起回答
+        }
+        closeFloatingComments(); //                                            快捷关闭悬浮评论（监听点击事件，点击网页两侧空白处）
+
+        if (location.pathname.indexOf('question') > -1 && location.href.indexOf('/log') == -1) { //       回答页 //
+            if (location.pathname.indexOf('waiting') == -1) {
+                collapsedNowAnswer('.QuestionPage'); //                        收起当前回答 + 快捷返回顶部
+                collapsedNowAnswer('.QuestionPage>#AnswerFormPortalContainer+div>div:first-child'); //收起当前回答 + 快捷返回顶部
+                if (location.pathname.indexOf('answer') > -1) { // 回答页：将「查看全部回答」选项改成静态链接，避免功能交叉混乱
+                    document.querySelectorAll('div.Card.ViewAll>a').forEach((a)=>{a.outerHTML = a.outerHTML;})
+                }
+                defaultCollapsedAnswer(); //                                   默认收起回答
+            }
+            setInterval(function(){topTime_('.ContentItem.AnswerItem', 'ContentItem-meta')}, 300); // 置顶显示时间
+            setTimeout(function(){question_time(); question_author()}, 100); //问题创建时间 + 显示问题作者
+
+        } else if (location.pathname === '/search') { //          搜索结果页 //
+            collapsedNowAnswer('main div'); //                                 收起当前回答 + 快捷返回顶部
+            collapsedNowAnswer('.Search-container'); //                        收起当前回答 + 快捷返回顶部
+            setInterval(function(){topTime_('.ContentItem.AnswerItem, .ContentItem.ArticleItem', 'SearchItem-meta')}, 300); // 置顶显示时间
+            addTypeTips(); //                                                  区分问题文章
+            addToQuestion(); //                                                直达问题按钮
+
+        } else if (location.pathname.indexOf('/topic/') > -1) { //   话题页 //
+            if (location.pathname.indexOf('/hot') > -1 || location.href.indexOf('/top-answers') > -1) { // 仅限 [讨论] [精华]
+                collapsedNowAnswer('main.App-main'); //                        收起当前回答 + 快捷返回顶部
+                setInterval(function(){topTime_('.ContentItem.AnswerItem, .ContentItem.ArticleItem', 'ContentItem-meta')}, 300); // 置顶显示时间
+                addTypeTips(); //                                              区分问题文章
+                addToQuestion(); //                                            直达问题按钮
+            }
+
+        } else if (location.hostname === 'zhuanlan.zhihu.com'){ //    文章 //
+            backToTop('.Post-content'); //                                     快捷返回顶部
+            setTimeout(topTime_post, 300); //                                  置顶显示时间
+
+        } else if (location.pathname.indexOf('/column/') > -1) { //    专栏 //
+            setTimeout(function(){
+                collapsedAnswer(); //                                           一键收起回答
+                collapsedNowAnswer('main div'); //                              收起当前回答 + 快捷返回顶部
+                setInterval(function(){topTime_('.ContentItem.AnswerItem, .ContentItem.ArticleItem', 'ContentItem-meta')}, 300); // 置顶显示时间
+            }, 300);
+
+        } else if (location.pathname.indexOf('/people/') > -1 || location.href.indexOf('org') > -1) { // 用户主页 //
+            // 【2026-09-26 修复】原写法漏了大括号：if 只管到 addTypeTips()，addToQuestion() 变成
+            // 无条件执行（/people/ 下的所有子页都会跑）。按缩进本意补上括号，两者都只在
+            // 主页路径（/people/xxx 或 org 主页，split 后恰好 3 段）执行，子页（/answers 等）不再跑。
+            if (location.pathname.split('/').length === 3) { addTypeTips(); addToQuestion(); } // 区分问题文章、直达问题按钮
+            collapsedNowAnswer('main div'); //                                 收起当前回答 + 快捷返回顶部
+            collapsedNowAnswer('.Profile-main'); //                            收起当前回答 + 快捷返回顶部
+            setInterval(function(){topTime_('.ContentItem.AnswerItem, .ContentItem.ArticleItem', 'ContentItem-meta')}, 300); // 置顶显示时间
+
+        } else if (location.pathname.indexOf('/collection/') > -1) { // 收藏夹 //
+            addTypeTips(); //                                                  区分问题文章
+            addToQuestion(); //                                                直达问题按钮
+            collapsedNowAnswer('main'); //                                     收起当前回答 + 快捷返回顶部
+            collapsedNowAnswer('.CollectionsDetailPage'); //                   收起当前回答 + 快捷返回顶部
+            setInterval(function(){topTime_('.ContentItem.AnswerItem, .ContentItem.ArticleItem', 'ContentItem-meta')}, 300); // 置顶显示时间
+
+        } else if (location.pathname.indexOf('/pin/') > -1) { // 想法 //
+            backToTop('main[role=main]'); //                                   快捷返回顶部
+            setInterval(function(){topTime_('.ContentItem.PinItem', 'ContentItem-meta')}, 300); // 置顶显示时间
+
+        } else if (location.pathname === '/') { //    首页（推荐流；导航入口已隐藏，经 logo / 直链进入）//
+            splitViewSync(); // 双栏（DOM 已就绪，此时量到的 header 高度才准）
+
+            feedVoteFilter(); // 只展示赞同数 ≥ 10 的内容（无赞同数的「问题」类卡片一并隐藏）
+            setInterval(feedVoteFilter, 800); // 无限滚动持续追加卡片、React 重建会丢类名，定期复查
+
+            collapsedNowAnswer('.App-main .Topstory'); //                      收起当前回答 + 快捷返回顶部
+            collapsedNowAnswer('.App-main .Topstory-container'); //            收起当前回答 + 快捷返回顶部
+            setInterval(function(){topTime_('.TopstoryItem', 'ContentItem-meta')}, 300); // 置顶显示时间
+            addTypeTips(); //                                                  区分问题文章
+            addToQuestion(); //                                                直达问题按钮
+        }
+    }
+})();
